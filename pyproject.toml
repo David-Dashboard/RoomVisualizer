@@ -23,6 +23,10 @@ dependencies = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8",
     "pillow>=10.0",
+    # HEIC is the iPhone's default photo format, and neither OpenCV's wheels
+    # nor Pillow can decode it unaided.  Without this a room shot on a phone
+    # fails with "no images found in directory".
+    "pillow-heif>=0.13",
     "scipy>=1.10",
     "trimesh>=4.0",
 ]

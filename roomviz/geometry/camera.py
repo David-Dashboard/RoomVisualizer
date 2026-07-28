@@ -31,6 +31,13 @@ def intrinsics_from_exif(path: str | Path, width: int, height: int) -> CameraInt
     except ImportError:  # pragma: no cover
         return None
 
+    # HEIC carries EXIF like any other format, but Pillow cannot open the file
+    # at all without the plugin - and a silent `return None` here costs the
+    # field of view, not just the format.
+    from .._heif import enable_heif
+
+    enable_heif()
+
     try:
         with Image.open(path) as img:
             exif = img.getexif()

@@ -15,7 +15,12 @@ from ..types import Frame
 
 log = logging.getLogger(__name__)
 
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+HEIF_EXTENSIONS = {".heic", ".heif"}
+"""Formats that need the pillow-heif plugin; see :mod:`roomviz._heif`."""
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", *HEIF_EXTENSIONS
+}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm", ".mpg", ".mpeg"}
 
 
@@ -113,7 +118,21 @@ def sharpness(rgb: np.ndarray) -> float:
     return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
+def _read_heif(path: Path) -> np.ndarray:
+    """Decode a HEIC/HEIF photo through Pillow's plugin."""
+    from .._heif import HEIF_INSTALL_HINT, enable_heif
+
+    if not enable_heif():
+        raise ImportError(f"cannot read {path.name}: {HEIF_INSTALL_HINT}")
+    from PIL import Image
+
+    with Image.open(path) as img:
+        return np.asarray(img.convert("RGB"))
+
+
 def _read_image(path: Path) -> np.ndarray:
+    if path.suffix.lower() in HEIF_EXTENSIONS:
+        return _read_heif(path)
     # imdecode handles non-ASCII paths that imread trips over on some builds.
     data = np.fromfile(str(path), dtype=np.uint8)
     bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)

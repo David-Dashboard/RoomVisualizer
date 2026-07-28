@@ -691,3 +691,73 @@ def test_using_every_photo_is_not_warned_about(tmp_path, caplog):
         r for r in caplog.records
         if r.levelname == "WARNING" and "photos" in r.getMessage()
     ]
+
+
+def _heic_folder(tmp_path, count: int = 4, name: str = "heic", suffix: str = ".HEIC"):
+    """A folder of HEIC photos, as an iPhone writes them by default."""
+    pillow_heif = pytest.importorskip("pillow_heif")
+    from PIL import Image
+
+    pillow_heif.register_heif_opener()
+    directory = tmp_path / name
+    directory.mkdir()
+    rng = np.random.default_rng(0)
+    for i in range(count):
+        img = Image.fromarray(rng.integers(0, 255, (240, 320, 3), dtype=np.uint8))
+        exif = Image.Exif()
+        exif[41989] = 13  # 35mm-equivalent focal length: an ultra-wide
+        img.save(directory / f"IMG_{i:04d}{suffix}", exif=exif)
+    return directory
+
+
+def test_a_folder_of_heic_photos_loads(tmp_path):
+    """HEIC is the iPhone's default, so it is the format a capture arrives in.
+
+    Neither OpenCV's wheels nor Pillow decode it unaided, and without support
+    the failure is `no images found in directory` - which reads as "you pointed
+    me at the wrong folder" rather than "this format is unsupported".
+    """
+    directory = _heic_folder(tmp_path)
+    frames = load_frames(directory, PipelineConfig(max_frames=4, max_side=320))
+    assert len(frames) == 4
+    assert frames[0].rgb.shape == (240, 320, 3)
+
+
+def test_heic_extensions_are_matched_case_insensitively(tmp_path):
+    """iOS writes `.HEIC`; the extension check has to lowercase first."""
+    from roomviz.media.loader import classify as classify_media
+
+    upper = classify_media(_heic_folder(tmp_path, 3, name="upper", suffix=".HEIC"))
+    lower = classify_media(_heic_folder(tmp_path, 3, name="lower", suffix=".heic"))
+    assert upper.kind == lower.kind == "image_dir"
+    assert upper.frame_count == lower.frame_count == 3
+
+
+def test_heic_photos_still_yield_their_field_of_view_from_exif(tmp_path):
+    """Decoding is only half of it.
+
+    Pillow cannot open a HEIC at all without the plugin, so EXIF reading fails
+    the same way - and a capture that decoded but reported no focal length
+    would silently fall back to a guessed field of view, scaling every
+    dimension in the output.
+    """
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    directory = _heic_folder(tmp_path, 4, name="exif")
+    cfg = PipelineConfig(max_frames=4, max_side=320)
+    frames = load_frames(directory, cfg)
+    intr = resolve_intrinsics(
+        cfg, frames[0].width, frames[0].height,
+        source_path=frames[0].source, original_size=frames[0].original_size,
+    )
+    assert intr.provenance == "exif"
+    hfov = np.degrees(2 * np.arctan((intr.width / 2) / intr.fx))
+    assert hfov > 100.0, hfov
+
+
+def test_a_missing_heif_plugin_says_how_to_fix_it(tmp_path, monkeypatch):
+    """The error has to name the package, not just fail to decode."""
+    directory = _heic_folder(tmp_path, 2, name="noplugin")
+    monkeypatch.setattr("roomviz._heif.enable_heif", lambda: False)
+    with pytest.raises(ImportError, match="pillow-heif"):
+        load_frames(directory, PipelineConfig(max_frames=2, max_side=320))
