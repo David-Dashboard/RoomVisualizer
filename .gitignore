@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Pipeline output
+output/
+examples/demo/
+*.ply
+*.glb
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.coverage
+.DS_Store
