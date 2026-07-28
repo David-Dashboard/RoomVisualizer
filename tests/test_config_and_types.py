@@ -466,3 +466,69 @@ def test_wall_extents_use_the_edge_the_quad_actually_runs_along():
     )
     # Horizontals report longest-first regardless of corner order.
     assert ceiling.extents == pytest.approx((6.0, 2.5))
+
+
+# --------------------------------------------------------------------------
+# gaps found by mutation testing
+# --------------------------------------------------------------------------
+
+def test_a_wall_reports_its_horizontal_span_first_even_when_slightly_tilted():
+    """`extents` returns (width, height) for a wall, in that order.
+
+    Which of the quad's two edges is the "horizontal" one is decided by
+    comparing their vertical components, and a fitted wall is never perfectly
+    axis-aligned - the first edge almost always has a small non-zero rise.  A
+    comparison that only asks "is the first edge's rise non-zero" gets every
+    such wall backwards, reporting a 3 m wide, 2.5 m tall wall as 2.5 x 3.0.
+    """
+    # First edge: 3 m long, 4 cm of rise (a plausible fit residual).
+    # Second edge: straight up, 2.5 m.
+    quad = np.array(
+        [
+            [0.0, 0.00, 0.0],
+            [3.0, 0.04, 0.0],
+            [3.0, 2.54, 0.0],
+            [0.0, 2.50, 0.0],
+        ]
+    )
+    wall = PlaneSurface(
+        surface_id=0, kind="wall", normal=np.array([0.0, 0.0, 1.0]),
+        offset=0.0, quad=quad, area=7.5, inlier_count=900,
+    )
+    width, height = wall.extents
+    assert width == pytest.approx(3.0, abs=0.05)
+    assert height == pytest.approx(2.5, abs=0.05)
+    assert width > height
+    # to_dict must carry the same orientation, since that is what reaches JSON.
+    assert wall.to_dict()["width"] > wall.to_dict()["height"]
+
+
+def test_run_supplies_a_default_config_when_given_none(tmp_path, monkeypatch):
+    """`run(input, output)` must work without a config.
+
+    The signature says `cfg` is optional, but nothing end-to-end ever omits it
+    - every test and the CLI both build one - so a dropped default would only
+    surface as an AttributeError in a user's first script.
+    """
+    import roomviz.pipeline as pipeline
+
+    seen = {}
+
+    def fake_reconstruct(input_path, cfg):
+        seen["cfg"] = cfg
+        return Scene(
+            points=np.zeros((0, 3), np.float32), colors=np.zeros((0, 3), np.uint8),
+            objects=[], surfaces=[], poses=[np.eye(4)], intrinsics=None, meta={},
+        ), []
+
+    def fake_export(scene, output_dir, cfg):
+        seen["export_cfg"] = cfg
+        return {}
+
+    monkeypatch.setattr(pipeline, "reconstruct", fake_reconstruct)
+    monkeypatch.setattr(pipeline, "export_scene", fake_export)
+
+    pipeline.run(tmp_path / "input.mp4", tmp_path / "out")
+
+    assert isinstance(seen["cfg"], PipelineConfig)
+    assert isinstance(seen["export_cfg"], PipelineConfig)

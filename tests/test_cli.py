@@ -330,3 +330,77 @@ def test_view_gives_up_cleanly_when_every_port_is_taken(tmp_path, monkeypatch, c
             sock.close()
     assert excinfo.value.code == 2
     assert "no free port" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# gaps found by mutation testing
+# --------------------------------------------------------------------------
+
+def test_a_subcommand_still_dispatches_when_argv_is_taken_from_sys_argv(monkeypatch, tmp_path):
+    """The console entry point calls `main()` with no arguments.
+
+    Every test calls `main([...])` explicitly, so `argv` is never None in the
+    suite - but it always is in real use, and `not argv` is True for None.  A
+    dispatch condition that ORs that in swallows every real invocation and
+    prints the backend list instead of doing the work.
+    """
+    import roomviz.cli as cli
+
+    called = {}
+
+    def fake_serve(directory, port, open_browser, host):
+        called["directory"] = directory
+
+    monkeypatch.setattr(cli, "serve", fake_serve)
+    monkeypatch.setattr("sys.argv", ["roomviz", "view", str(tmp_path), "--no-browser"])
+
+    assert cli.main() == 0
+    assert called.get("directory") == str(tmp_path), (
+        "the subcommand was not dispatched when argv came from sys.argv"
+    )
+
+
+def test_the_lan_hint_prints_an_address_not_a_port(monkeypatch, tmp_path, capsys):
+    """`--host 0.0.0.0` prints a second URL for other machines on the network.
+
+    `getsockname()` returns `(address, port)`; taking the wrong element yields
+    a URL like `http://54321:8000/viewer.html`, which is a plausible-looking
+    string that no browser can reach.
+    """
+    import socket as socket_module
+    import socketserver
+
+    import roomviz.cli as cli
+
+    (tmp_path / "viewer.html").write_text("<html></html>")
+
+    class FakeProbe:
+        def connect(self, address):
+            pass
+
+        def getsockname(self):
+            return ("192.168.1.42", 54321)
+
+        def close(self):
+            pass
+
+    real_socket = socket_module.socket
+
+    def fake_socket(family=socket_module.AF_INET, type=socket_module.SOCK_STREAM, *a, **k):
+        # Only the LAN probe uses a datagram socket; the HTTP server itself
+        # must still get a real one.
+        if type == socket_module.SOCK_DGRAM:
+            return FakeProbe()
+        return real_socket(family, type, *a, **k)
+
+    monkeypatch.setattr(socket_module, "socket", fake_socket)
+    monkeypatch.setattr(
+        socketserver.TCPServer, "serve_forever",
+        lambda self, *a, **k: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    cli.serve(tmp_path, port=8931, open_browser=False, host="0.0.0.0")
+
+    printed = capsys.readouterr().out
+    assert "on your network:" in printed, printed
+    assert "http://192.168.1.42:" in printed, printed

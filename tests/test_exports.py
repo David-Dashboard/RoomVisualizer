@@ -602,3 +602,158 @@ def test_reconstruct_handles_a_single_image_and_records_its_timing(tmp_path):
     assert isinstance(scene.meta["elapsed_seconds"], float)
     assert scene.meta["elapsed_seconds"] >= 0.0
     assert scene.meta["input"] == str(image)
+
+
+# --------------------------------------------------------------------------
+# palette, wireframe and PLY guards
+#
+# These are output contracts nothing end-to-end constrains: a scene renders
+# and validates whatever colours it is given, and a wireframe with a wrong
+# edge is still a valid GLB.  Mutation testing found all of them unguarded.
+# --------------------------------------------------------------------------
+
+# The published palette.  These are not arbitrary snapshots: object colours
+# travel in `scene.json` and `scene.glb`, and `label_color`'s contract is that
+# "chair" is the same colour in every scene and every version.  Changing the
+# hash-to-colour mapping is therefore a breaking change for anything that
+# stored a previous run, and has to be a deliberate edit to this table rather
+# than a side effect.
+PUBLISHED_COLOURS = {
+    "chair": (64, 170, 186),
+    "sofa": (88, 227, 150),
+    "table": (141, 33, 217),
+    "bookcase": (228, 122, 70),
+    "painting": (184, 226, 69),
+    "lamp": (149, 104, 210),
+    "curtain": (165, 91, 196),
+}
+
+
+@pytest.mark.parametrize("label,expected", sorted(PUBLISHED_COLOURS.items()))
+def test_label_colour_is_the_published_value(label, expected):
+    from roomviz.export.palette import label_color
+
+    assert label_color(label) == expected
+
+
+def test_label_colours_are_bytes_in_the_legibility_band():
+    """The band is the point of the palette, not a detail of it.
+
+    Hue is free, but saturation and lightness are deliberately narrow so every
+    colour stays legible on both light and dark viewer backgrounds.  Scaling a
+    channel by 256 rather than 255 also puts 256 in reach of a byte field,
+    which silently truncates in the GLB and the PLY.
+    """
+    import colorsys
+
+    from roomviz.export.palette import label_color
+
+    labels = [f"class_{i}" for i in range(400)] + list(PUBLISHED_COLOURS)
+    for label in labels:
+        rgb = label_color(label)
+        assert len(rgb) == 3
+        for channel in rgb:
+            assert isinstance(channel, int)
+            assert 0 <= channel <= 255, (label, rgb)
+        h, lightness, saturation = colorsys.rgb_to_hls(*[c / 255.0 for c in rgb])
+        assert 0.44 <= lightness <= 0.68, (label, lightness)
+        assert 0.40 <= saturation <= 0.80, (label, saturation)
+
+
+def test_label_colours_are_stable_and_spread_across_the_hue_circle():
+    from roomviz.export.palette import label_color
+
+    assert label_color("chair") == label_color("chair")
+    labels = [f"class_{i}" for i in range(200)]
+    hues = {label_color(name)[0] for name in labels}
+    # Distinct labels must not collapse onto a handful of colours.
+    assert len(hues) > 100
+
+
+def test_bounding_box_wireframe_draws_all_twelve_edges():
+    """Every edge of the box must actually have a bar on it.
+
+    The wireframe is a hand-written index list, and a wrong index is invisible
+    to every other check: the GLB still validates, the bounding box is
+    unchanged, and the mesh still looks like a box from most angles - it just
+    silently doubles one edge and leaves another missing.  Asking for a bar
+    near each of the twelve true edge midpoints is what notices.
+    """
+    trimesh = pytest.importorskip("trimesh")
+
+    from roomviz.export.gltf import _box_mesh
+
+    # Deliberately unequal extents, so a swapped index changes the geometry
+    # instead of landing on a symmetric duplicate.
+    lo = np.array([0.0, 0.0, 0.0])
+    hi = np.array([0.7, 1.9, 3.1])
+    mesh = _box_mesh(trimesh, lo, hi, (200, 100, 50))
+    assert mesh is not None
+    vertices = np.asarray(mesh.vertices)
+
+    corners = np.array(
+        [
+            [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
+            [hi[0], hi[1], lo[2]], [lo[0], hi[1], lo[2]],
+            [lo[0], lo[1], hi[2]], [hi[0], lo[1], hi[2]],
+            [hi[0], hi[1], hi[2]], [lo[0], hi[1], hi[2]],
+        ]
+    )
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+    # Each pair differs in exactly one axis - that is what makes it an edge of
+    # the box rather than a face or body diagonal.
+    for i, j in edges:
+        differing = int((np.abs(corners[i] - corners[j]) > 1e-9).sum())
+        assert differing == 1, (i, j)
+
+    # Each bar is its own connected component, so the twelve bar centres must
+    # be the twelve edge midpoints - no edge missing, none drawn twice.
+    bars = mesh.split(only_watertight=False)
+    assert len(bars) == 12, f"expected 12 bars, got {len(bars)}"
+    drawn = sorted(tuple(np.round(np.asarray(b.bounds).mean(axis=0), 4)) for b in bars)
+    expected = sorted(
+        tuple(np.round((corners[i] + corners[j]) / 2.0, 4)) for i, j in edges
+    )
+    for got, want in zip(drawn, expected, strict=True):
+        assert np.allclose(got, want, atol=0.02), f"bar at {got}, expected one at {want}"
+    del vertices
+
+
+def test_write_ply_accepts_list_input_and_flat_arrays(tmp_path):
+    """`write_ply` coerces its input; callers are not required to pre-shape it.
+
+    Every internal caller already hands it a float32 (N, 3) array, so the
+    coercion is dead weight from the suite's point of view - right up until a
+    user passes a list of tuples, which is the obvious thing to do.
+    """
+    from roomviz.export.ply import write_ply
+
+    out = write_ply(tmp_path / "list.ply", [(0.0, 1.0, 2.0), (3.0, 4.0, 5.0)])
+    assert out.exists()
+
+    flat = np.arange(9, dtype=np.float64)  # 3 points, flat and the wrong dtype
+    out2 = write_ply(tmp_path / "flat.ply", flat)
+    body = out2.read_bytes()
+    assert b"element vertex 3" in body
+
+
+def test_write_ply_reports_the_real_counts_when_colours_do_not_match(tmp_path):
+    """The mismatch message has to name the two numbers that disagree.
+
+    An error that says "colour count 3 does not match point count 3" is worse
+    than no message at all - it sends the reader looking for a bug that is not
+    there.
+    """
+    from roomviz.export.ply import write_ply
+
+    points = np.zeros((3, 3), np.float32)
+    colors = np.zeros((2, 3), np.uint8)
+    with pytest.raises(ValueError) as excinfo:
+        write_ply(tmp_path / "bad.ply", points, colors)
+    message = str(excinfo.value)
+    assert "colour count 2" in message, message
+    assert "point count 3" in message, message

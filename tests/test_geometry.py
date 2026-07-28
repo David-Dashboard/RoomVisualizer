@@ -9,6 +9,7 @@ from roomviz.geometry.align import (
     alignment_transform,
     apply_transform,
     estimate_up,
+    manhattan_yaw,
     rotation_between,
 )
 from roomviz.geometry.camera import backproject, depth_edge_mask, pixel_rays, project
@@ -22,6 +23,7 @@ from roomviz.geometry.planes import (
 from roomviz.geometry.pointcloud import (
     cluster_connected,
     largest_clusters,
+    remove_statistical_outliers,
     voxel_downsample,
     voxel_iou,
     voxel_overlap,
@@ -905,3 +907,116 @@ def test_statistical_outlier_removal_keeps_the_bulk_and_drops_the_stragglers():
     assert not remove_statistical_outliers(points, k=12, std_ratio=0.05).all()
     # Too few points to judge: keep them all rather than delete the cloud.
     assert remove_statistical_outliers(np.zeros((5, 3), np.float32), k=12).all()
+
+
+# --------------------------------------------------------------------------
+# gaps found by mutation testing
+# --------------------------------------------------------------------------
+
+def test_estimate_up_refuses_walls_that_are_only_nearly_parallel():
+    """The rank test has to fire on a *realistic* corridor, not just an ideal one.
+
+    `test_estimate_up_refuses_rank_deficient_walls` uses exactly parallel
+    walls, where the second singular value is exactly zero -- and zero is below
+    any multiple of itself, so that fixture cannot tell a real rank test from
+    one comparing the spectrum against itself.  Fitted walls are never exactly
+    parallel: a few degrees of fit error is normal, which lifts the second
+    singular value off zero while leaving the null space just as ambiguous.
+    """
+    rng = np.random.default_rng(21)
+    n = 3000
+    tilt = np.deg2rad(5.0)
+    z_a = rng.uniform(-2, 2, n)
+    z_b = rng.uniform(-2, 2, n)
+    # Two walls whose normals differ by 5 degrees about the vertical axis.
+    wall_a = np.column_stack([np.zeros(n), rng.uniform(0, 2.5, n), z_a])
+    wall_b = np.column_stack(
+        [4.0 - z_b * np.tan(tilt), rng.uniform(0, 2.5, n), z_b]
+    )
+    points = np.vstack([wall_a, wall_b]).astype(np.float32)
+    kinds = np.array(["wall"] * (2 * n), dtype=object)
+
+    prior = np.array([0.0, -1.0, 0.0])
+    up = estimate_up(points, kinds, fallback=prior)
+    assert np.allclose(up, prior, atol=1e-9), (
+        f"accepted a near-parallel wall pair and returned {np.round(up, 3)}"
+    )
+
+
+def test_manhattan_yaw_is_zero_when_no_wall_plane_can_be_fitted():
+    """Diffuse "wall" points support no heading, so the answer is no rotation.
+
+    Enough points to pass the count gate, but scattered through a volume, so
+    no plane reaches the inlier floor and there is nothing to average.  Any
+    non-zero answer here would rotate the whole room on the strength of noise.
+    """
+    rng = np.random.default_rng(3)
+    blob = rng.uniform(-1.0, 1.0, size=(400, 3)).astype(np.float32)
+    kinds = np.array(["wall"] * 400, dtype=object)
+    assert manhattan_yaw(blob, kinds) == 0.0
+
+
+def test_outlier_rejection_actually_uses_its_standard_deviation_cut():
+    """The default cut is 2 sigma, and 2 sigma has to mean something.
+
+    Every fixture elsewhere uses outliers far outside any plausible cut, so
+    the threshold could move by 25% -- or be dropped -- without a single test
+    noticing.  These outliers sit in the band between the shipped cut and a
+    looser one, which is exactly where the parameter earns its keep.
+    """
+    rng = np.random.default_rng(5)
+    core = rng.normal(scale=0.01, size=(3000, 3))
+    # A graded tail rather than one distant clump: a tight clump of strays has
+    # small neighbour distances *within the clump*, so it survives any cut and
+    # says nothing about the threshold.  Spreading isolated points through a
+    # shell makes the mean-neighbour-distance vary continuously, which is what
+    # gives the cut somewhere to bite.
+    direction = rng.normal(size=(300, 3))
+    direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+    tail = direction * rng.uniform(0.05, 0.6, 300)[:, None]
+    points = np.vstack([core, tail]).astype(np.float32)
+
+    kept = {
+        ratio: int(remove_statistical_outliers(points, std_ratio=ratio)[3000:].sum())
+        for ratio in (1.5, 2.0, 2.5, 3.5)
+    }
+    default_kept = int(remove_statistical_outliers(points)[3000:].sum())
+
+    # Looser cut, strictly more survivors -- the parameter has to do something.
+    assert kept[1.5] < kept[2.0] < kept[2.5] < kept[3.5], kept
+    # The shipped default is 2.0, not 2.5 and not "whatever".
+    assert default_kept == kept[2.0], (default_kept, kept)
+    assert default_kept != kept[2.5]
+    # The dense core is never touched: this rejects a tail, not the cloud.
+    assert int(remove_statistical_outliers(points)[:3000].sum()) == 3000
+
+
+def test_ransac_fallback_fires_on_exactly_collinear_points_and_gets_the_offset_right():
+    """The all-triplets-degenerate branch needs input that is *exactly* a line.
+
+    `test_ransac_plane_on_degenerate_input_falls_back_to_least_squares` builds
+    its line by scaling a float direction, so rounding leaves every cross
+    product just above the 1e-8 floor -- RANSAC finds hypotheses and the
+    fallback never runs.  Integer coordinates along an axis make the cross
+    products exactly zero, which is the only way into that branch.
+    """
+    # Exactly collinear, and deliberately far from the origin so the sign of
+    # `offset` in the fallback's own inlier test is not free.
+    line = np.column_stack(
+        [np.arange(200.0), np.full(200, 5.0), np.full(200, 7.0)]
+    )
+    normal, offset, mask = ransac_plane(line, threshold=0.01,
+                                        rng=np.random.default_rng(0))
+    assert abs(offset) > 1.0, "fixture must not sit on a plane through the origin"
+    assert np.abs(line @ normal + offset).max() < 1e-9
+    assert mask.all(), "the fallback returned a mask that excludes its own points"
+
+
+# The refit guard `if inliers.sum() >= 3` is deliberately left unpinned.
+# Raising it to 4 only changes behaviour when the winning inlier set is
+# exactly three points, and in that regime the least-squares fit of three
+# points *is* the plane through them, so the refit is a no-op.  Every random
+# triplet also trivially has three inliers of its own, so which plane wins is
+# a tie broken by draw order rather than a property worth asserting -- and
+# `extract_surfaces` discards anything below `min_inliers` (hundreds) long
+# before it matters.  A test here could only pin the tie-break.

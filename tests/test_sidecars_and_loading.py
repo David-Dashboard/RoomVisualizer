@@ -495,3 +495,56 @@ def test_an_image_with_an_unrecognised_extension_is_still_read_as_an_image(tmp_p
     path.write_bytes((tmp_path / "photo.png").read_bytes())
     assert classify_media(path).kind == "image"
     assert classify_media(path).frame_count == 1
+
+
+# --------------------------------------------------------------------------
+# gaps found by mutation testing
+# --------------------------------------------------------------------------
+
+def test_a_zero_indexed_set_with_a_gap_is_not_mistaken_for_one_indexed(tmp_path):
+    """A gap in a 0-indexed export is legitimate and must not be refused.
+
+    The 1-indexed check keys on index 0 being *absent*.  Asking instead
+    whether 0 is present *and* the set looks contiguous rejects a perfectly
+    good strided export -- files 0, 1, 2, 4 have `max == len`, which is the
+    same shape the 1-indexed test looks for.
+    """
+    for index in (0, 1, 2, 4):
+        np.save(tmp_path / f"{index:06d}.npy", np.zeros((4, 4), np.float32))
+    check_sidecar_numbering(tmp_path, (".npy",))  # must not raise
+
+
+def test_a_one_indexed_set_is_still_refused(tmp_path):
+    """The control: the check above must not have disarmed the real refusal."""
+    for index in (1, 2, 3):
+        np.save(tmp_path / f"{index:06d}.npy", np.zeros((4, 4), np.float32))
+    with pytest.raises(ValueError, match="numbered from 1"):
+        check_sidecar_numbering(tmp_path, (".npy",))
+
+
+def test_a_fractional_sharpness_threshold_still_filters(tmp_path):
+    """`min_sharpness` is a float, and values below 1 have to work.
+
+    Every other fixture uses 0 (off) or a large value, so a guard reading
+    `> 1` instead of `> 0` behaves identically in all of them while silently
+    disabling the filter for exactly the range a user tuning it would try.
+    """
+    video = tmp_path / "clip.mp4"
+    rng = np.random.default_rng(0)
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 64))
+    for i in range(12):
+        blank = np.zeros((64, 64, 3), np.uint8)
+        textured = rng.integers(0, 255, (64, 64, 3), dtype=np.uint8)
+        writer.write(blank if i % 2 else textured)
+    writer.release()
+
+    def kept(min_sharpness: float) -> list[int]:
+        cfg = PipelineConfig(
+            min_sharpness=min_sharpness, max_frames=20, max_side=64, frame_stride=1
+        )
+        return [f.source_index for f in load_frames(video, cfg)]
+
+    # A fractional threshold drops the blank frames ...
+    assert kept(0.5) == [0, 2, 4, 6, 8, 10]
+    # ... and zero means "keep everything", which is the documented off switch.
+    assert kept(0.0) == list(range(12))

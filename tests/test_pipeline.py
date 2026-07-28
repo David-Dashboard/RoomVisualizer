@@ -1024,3 +1024,27 @@ def test_observed_floor_area_tracks_how_much_floor_was_filmed(rendered):
     # make the flag useless.
     assert any(c.startswith("partial_floor") for c in partial["caveats"])
     assert not any(c.startswith("partial_floor") for c in full["caveats"])
+
+
+def test_a_frame_link_that_fails_reuses_the_previous_pose():
+    """When odometry cannot solve a link, the camera stays where it was.
+
+    Nothing else exercises this: every synthetic sequence is well textured, so
+    every link solves and the fallback branch never runs.  It is the branch
+    that matters most on real footage, though - a motion-blurred or blank
+    frame is exactly where tracking gives up, and reaching back to the wrong
+    entry there either crashes on the first frame or silently rewinds the
+    trajectory.
+    """
+    blank = np.zeros((64, 64, 3), np.uint8)
+    frames = [Frame(index=i, rgb=blank.copy(), source_index=i) for i in range(3)]
+    depths = [DepthMap(depth=np.full((64, 64), 2.0, np.float32)) for _ in range(3)]
+    intr = CameraIntrinsics.from_hfov(64, 64, 90.0)
+
+    poses = estimate_trajectory(frames, depths, intr, build_config())
+
+    assert len(poses) == 3
+    # Featureless frames give ORB nothing to match, so every link fails and
+    # the trajectory must stay put rather than drift or crash.
+    for pose in poses:
+        assert np.allclose(pose, np.eye(4), atol=1e-9), pose
