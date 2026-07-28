@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roomviz"
+version = "0.1.0"
+description = "3D room reconstruction from images and video, with per-object segmentation and wall extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["3d-reconstruction", "segmentation", "depth-estimation", "point-cloud", "computer-vision"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+    "pillow>=10.0",
+    "scipy>=1.10",
+    "trimesh>=4.0",
+]
+
+[project.optional-dependencies]
+# Neural depth + segmentation backends.  Not required when feeding the pipeline
+# precomputed depth and masks via the `file` backends.
+models = [
+    "torch>=2.1",
+    "transformers>=4.41",
+    "timm>=0.9",
+    "accelerate>=0.30",
+]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+roomviz = "roomviz.cli:main"
+
+[project.urls]
+Repository = "https://github.com/David-Dashboard/RoomVisualizer"
+
+[tool.setuptools.packages.find]
+include = ["roomviz*"]
+
+[tool.setuptools.package-data]
+roomviz = ["viewer_assets/*.js", "viewer_assets/jsm/**/*.js"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["B008", "E501"]
