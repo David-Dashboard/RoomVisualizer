@@ -532,3 +532,51 @@ def test_run_supplies_a_default_config_when_given_none(tmp_path, monkeypatch):
 
     assert isinstance(seen["cfg"], PipelineConfig)
     assert isinstance(seen["export_cfg"], PipelineConfig)
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        # COCO-panoptic builds compound stuff names out of hyphens and
+        # qualifier suffixes.  Matching whole words only sent every one of
+        # these to "object", which yields a room with no shell at all.
+        ("wall-brick", ("structure", "wall")),
+        ("wall-stone", ("structure", "wall")),
+        ("wall-other-merged", ("structure", "wall")),
+        ("floor-wood", ("structure", "floor")),
+        ("floor-other-merged", ("structure", "floor")),
+        ("ceiling-tile", ("structure", "ceiling")),
+        ("ceiling-merged", ("structure", "ceiling")),
+        ("rug-merged", ("structure", "floor")),
+        ("window-other", ("structure", "window")),
+        ("door-stuff", ("structure", "door")),
+    ],
+)
+def test_compound_stuff_labels_are_recognised_as_structure(label, expected):
+    from roomviz.perception.labels import classify
+
+    assert classify(label) == expected
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        # The ADE20K vocabulary must be entirely unaffected by that change:
+        # these are the forms the default checkpoint actually emits.
+        ("wall", ("structure", "wall")),
+        ("floor", ("structure", "floor")),
+        ("ceiling", ("structure", "ceiling")),
+        ("windowpane, window", ("structure", "window")),
+        ("sofa, couch, lounge", ("object", None)),
+        ("swivel chair", ("object", None)),
+        ("chest of drawers, chest, bureau, dresser", ("object", None)),
+        ("person", ("object", None)),
+        # Placeholder names for ids missing from labels.json stay objects.
+        ("segment_5", ("object", None)),
+        ("class_12", ("object", None)),
+    ],
+)
+def test_the_ade_vocabulary_is_unchanged_by_compound_splitting(label, expected):
+    from roomviz.perception.labels import classify
+
+    assert classify(label) == expected

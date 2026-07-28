@@ -121,7 +121,16 @@ class Mask2FormerBackend:
             outputs = self.model(**inputs)
 
         result = self.processor.post_process_panoptic_segmentation(
-            outputs, target_sizes=[(h, w)]
+            outputs,
+            target_sizes=[(h, w)],
+            # Passed explicitly, and deliberately empty.  Left unset the
+            # processor logs "`label_ids_to_fuse` unset. No instance will be
+            # fused." once per frame, which buries the pipeline's own progress
+            # output.  Empty is also the behaviour we want: fusing a stuff
+            # class merges every wall in the image into one segment, and this
+            # pipeline separates objects in 3D instead, where it can tell two
+            # paintings apart by where they are rather than by class.
+            label_ids_to_fuse=set(),
         )[0]
 
         ids = result["segmentation"].detach().to("cpu").numpy().astype(np.int32)

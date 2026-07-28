@@ -56,7 +56,13 @@ IGNORE_NAMES: frozenset[str] = frozenset(
 # part of the floor plane, so keep it there rather than making it an object.
 _FLOOR_COVERINGS = {"rug", "carpet", "carpeting"}
 
-_SPLIT = re.compile(r"[;,/]")
+# ADE20K separates synonyms with commas ("sofa, couch, lounge").  COCO-panoptic
+# instead builds compound names out of hyphens and qualifier suffixes -
+# `wall-brick`, `floor-wood`, `ceiling-tile`, `rug-merged`, `window-other` - and
+# matching those on whole words alone sends every one of them to "object",
+# which silently produces a room with no walls, floor or ceiling.  Splitting on
+# the joiners too means the leading noun is seen either way.
+_SPLIT = re.compile(r"[;,/_-]")
 
 
 def synonyms(label: str) -> list[str]:

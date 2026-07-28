@@ -39,7 +39,12 @@ class PipelineConfig:
     depth_backend: str = "depth-anything-v2"
     depth_model: str = "depth-anything/Depth-Anything-V2-metric-indoor-small-hf"
     seg_backend: str = "mask2former"
-    seg_model: str = "facebook/mask2former-swin-base-ade-panoptic"
+    # Swin-L is the ADE20K *panoptic* checkpoint that actually exists on the
+    # hub: the base/small/tiny suffixes are published for ADE semantic and for
+    # COCO panoptic, but not for this combination, and asking for one returns a
+    # bare 401 that reads like an auth problem rather than a typo.  It is an
+    # 866 MB download and runs at roughly 2 s/frame on a CPU.
+    seg_model: str = "facebook/mask2former-swin-large-ade-panoptic"
     device: str = "auto"
 
     models_dir: str | None = None
