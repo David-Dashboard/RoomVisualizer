@@ -85,11 +85,16 @@ def ransac_plane(
     normal, offset = best
     inliers = np.abs(points @ normal + offset) <= threshold
 
-    # Refit on the full inlier set, then re-select: one round is enough to
-    # remove the bias of the random minimal sample.
+    # Refit on the full inlier set to remove the bias of the random minimal
+    # sample, re-select against the improved plane, then refit once more.  The
+    # final refit is what makes the returned plane exactly the least-squares
+    # fit of the inliers returned alongside it - without it the plane belongs
+    # to the *previous* inlier set, which is a confusing thing to hand back.
     if inliers.sum() >= 3:
         normal, offset = fit_plane_lsq(points[inliers])
         inliers = np.abs(points @ normal + offset) <= threshold
+        if inliers.sum() >= 3:
+            normal, offset = fit_plane_lsq(points[inliers])
     return normal, offset, inliers
 
 

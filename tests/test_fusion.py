@@ -17,6 +17,7 @@ from roomviz.fusion.scene_fusion import (
 from roomviz.geometry.pointcloud import (
     adaptive_voxel,
     median_spacing,
+    voxel_overlap,
 )
 from roomviz.types import ObjectInstance
 
@@ -112,6 +113,29 @@ def test_aabb_iou_extremes():
     assert _aabb_iou(a, a) == pytest.approx(1.0)
     b = instance(1, "x", block((9.0, 0.0, 0.0)))
     assert _aabb_iou(a, b) == 0.0
+
+
+def test_aabb_iou_is_a_union_not_a_maximum():
+    """Partial overlap must divide by the union.
+
+    Identical and disjoint boxes score the same under intersection-over-union,
+    over-maximum and over-minimum alike, so only a partial overlap tells them
+    apart -- and the difference straddles the 0.5 merge threshold.
+    """
+    def box(lo, hi):
+        corners = np.array([[x, y, z] for x in lo[:1] + hi[:1]
+                            for y in lo[1:2] + hi[1:2]
+                            for z in lo[2:3] + hi[2:3]], np.float32)
+        return instance(0, "x", corners)
+
+    # 1.0 x 1.0 x 1.0 boxes offset by 0.4 in x: overlap 0.6, union 1.4.
+    a = box([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    b = box([0.4, 0.0, 0.0], [1.4, 1.0, 1.0])
+    iou = _aabb_iou(a, b, thickness=0.0)
+    assert iou == pytest.approx(0.6 / 1.4, rel=1e-3)     # union: ~0.43
+    assert iou < 0.5                                     # so they must NOT merge
+    # over-maximum would give 0.6 here and wrongly merge them.
+    assert len(_merge_instances([a, b], gap=0.01)) == 2
 
 
 def test_drift_duplicates_are_merged():
@@ -272,13 +296,20 @@ def test_association_threshold_is_enforced():
     Two same-label objects seen in disjoint frame sets carry no conflicting
     evidence, so nothing but the overlap threshold stops them being fused.
     """
-    cfg = PipelineConfig(association_iou=0.15)
+    cfg = PipelineConfig(association_iou=0.35)
+    # The two must *touch* slightly: a pair with no overlap at all never
+    # becomes a candidate, so it would stay separate whether or not the
+    # threshold is applied, and would not test anything.
+    near = block((0.00, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=1500, seed=1)
+    far = block((0.38, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=1500, seed=3)
+    overlap = voxel_overlap(near, far, PipelineConfig().voxel_size * 3.0)
+    assert 0.0 < overlap < cfg.association_iou, overlap   # the case must be live
+
     detections = [
-        # One chair in frames 0-1, a different chair 4 m away in frames 2-3.
-        detection(0, "chair", block((0.0, 0.5, 0.0), seed=1), segment_id=1),
-        detection(1, "chair", block((0.0, 0.5, 0.0), seed=2), segment_id=1),
-        detection(2, "chair", block((4.0, 0.5, 0.0), seed=3), segment_id=1),
-        detection(3, "chair", block((4.0, 0.5, 0.0), seed=4), segment_id=1),
+        detection(0, "chair", near, segment_id=1),
+        detection(1, "chair", near + 0.005, segment_id=1),
+        detection(2, "chair", far, segment_id=1),
+        detection(3, "chair", far + 0.005, segment_id=1),
     ]
     instances = _associate(detections, cfg)
     assert len(instances) == 2, [
@@ -297,19 +328,41 @@ def test_association_threshold_admits_a_genuine_match():
     assert len(_associate(detections, cfg)) == 1
 
 
-def test_association_order_is_frame_ordered():
-    """Growing an instance through consecutive views is what bounds drift.
+def test_association_is_robust_to_input_order():
+    """A drifting object must fuse regardless of the order detections arrive.
 
-    Consuming detections out of frame order lets an instance jump from the
-    first view to the last, where accumulated pose error is largest.
+    Consecutive views overlap well while the first and last barely do, so an
+    implementation that consumed detections as given would split the object
+    when handed them scrambled.  (Ascending and descending frame order are
+    equivalent -- both walk the chain -- so only a scrambled order tests this.)
     """
     cfg = PipelineConfig(association_iou=0.35)
-    # A steadily drifting object: consecutive views overlap well, the first and
-    # last barely at all.
     detections = [
         detection(i, "sofa", block((0.35 * i, 0.5, 2.0), size=(0.8, 0.5, 0.5), n=1200,
                                    seed=i + 1), segment_id=1)
         for i in range(6)
     ]
-    assert len(_associate(detections, cfg)) == 1
-    assert len(_associate(list(reversed(detections)), cfg)) == 1
+    ends = voxel_overlap(detections[0].points, detections[-1].points,
+                         cfg.voxel_size * 3.0)
+    assert ends < cfg.association_iou, ends   # the ends really are far apart
+
+    for order in ([0, 5, 1, 4, 2, 3], [3, 0, 5, 2, 1, 4], [5, 4, 3, 2, 1, 0]):
+        scrambled = [detections[i] for i in order]
+        assert len(_associate(scrambled, cfg)) == 1, order
+
+
+def test_object_aabb_is_exactly_the_point_extent():
+    """`aabb` must report the measured extent, not a padded or scaled one.
+
+    Every dimension in `scene.json` derives from this, and end-to-end
+    tolerances are metres-scale, so a few percent of inflation here would pass
+    every downstream assertion while quietly overstating every object.
+    """
+    points = np.array(
+        [[-1.0, 2.0, 0.5], [3.0, -4.0, 0.5], [0.0, 0.0, 7.0]], np.float32
+    )
+    inst = instance(0, "x", points)
+    lo, hi = inst.aabb
+    assert lo.tolist() == [-1.0, -4.0, 0.5]
+    assert hi.tolist() == [3.0, 2.0, 7.0]
+    assert np.allclose(inst.centroid, points.mean(axis=0))

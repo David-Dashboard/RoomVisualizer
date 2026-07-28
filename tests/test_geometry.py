@@ -12,7 +12,13 @@ from roomviz.geometry.align import (
     rotation_between,
 )
 from roomviz.geometry.camera import backproject, depth_edge_mask, pixel_rays, project
-from roomviz.geometry.planes import extract_surfaces, fit_plane_lsq, plane_quad, ransac_plane
+from roomviz.geometry.planes import (
+    classify_plane,
+    extract_surfaces,
+    fit_plane_lsq,
+    plane_quad,
+    ransac_plane,
+)
 from roomviz.geometry.pointcloud import (
     cluster_connected,
     largest_clusters,
@@ -425,3 +431,52 @@ def test_merge_similar_folds_a_split_wall():
     # The merged wall must span both sheets, not just one.
     assert walls[0].inlier_count > 1.5 * n
     assert walls[0].quad[:, 2].max() - walls[0].quad[:, 2].min() > 3.0
+
+
+def test_classify_plane_without_labels_uses_height():
+    """The unlabelled branch exists for when segmentation gives no structure.
+
+    Every end-to-end scene supplies labels, so this fallback is only reachable
+    from here -- and swapping its two outcomes puts the ceiling on the floor.
+    """
+    up = np.array([0.0, 1.0, 0.0])
+    horizontal = np.array([0.0, 1.0, 0.0])
+    span = (0.0, 2.7)
+
+    assert classify_plane(horizontal, 0.0, up, None, 0.05, span) == "floor"
+    assert classify_plane(horizontal, -2.7, up, None, 2.65, span) == "ceiling"
+    # An empty label list must behave the same as no labels at all.
+    assert classify_plane(horizontal, 0.0, up, [], 0.05, span) == "floor"
+    # A vertical plane is a wall regardless of height.
+    assert classify_plane(np.array([1.0, 0.0, 0.0]), 0.0, up, None, 1.3, span) == "wall"
+
+
+def test_classify_plane_labels_break_the_floor_ceiling_tie():
+    up = np.array([0.0, 1.0, 0.0])
+    horizontal = np.array([0.0, 1.0, 0.0])
+    span = (0.0, 2.7)
+    # A low plane the segmenter calls ceiling is trusted over the height rule.
+    assert classify_plane(horizontal, 0.0, up, ["ceiling"] * 5, 0.05, span) == "ceiling"
+
+
+def test_ransac_plane_refits_on_its_inliers():
+    """The winning minimal sample is biased; the refit is what removes that.
+
+    Skipping it leaves the plane defined by three random points, which is
+    still accurate enough to pass loose end-to-end checks -- so the refit is
+    pinned exactly here instead.
+    """
+    rng = np.random.default_rng(31)
+    inliers = np.column_stack(
+        [rng.uniform(-1, 1, 1500), rng.uniform(-1, 1, 1500), rng.normal(0, 0.006, 1500) + 2.0]
+    )
+    outliers = rng.uniform(-3, 3, (400, 3))
+    points = np.vstack([inliers, outliers]).astype(np.float32)
+
+    normal, offset, mask = ransac_plane(points, threshold=0.03, rng=rng)
+    # The returned plane must be the least-squares fit of its own inliers.
+    refit_normal, refit_offset = fit_plane_lsq(points[mask])
+    if float(refit_normal @ normal) < 0:
+        refit_normal, refit_offset = -refit_normal, -refit_offset
+    assert np.allclose(normal, refit_normal, atol=1e-6)
+    assert offset == pytest.approx(refit_offset, abs=1e-6)
