@@ -179,14 +179,21 @@ def test_rotation_between_survives_the_near_antiparallel_band():
     up = np.array([0.0, 1.0, 0.0])
     for tilt_deg in (3.0, 0.5, 0.05, 0.01, 1e-3, 1e-5, 1e-9, 0.0):
         t = np.deg2rad(tilt_deg)
-        down = np.array([np.sin(t), -np.cos(t), 0.0])
-        rotation = rotation_between(down, up)
+        # float32 as well as float64: `fit_plane_lsq` on a float32 cloud
+        # returns a float32 normal, so float32 is what the pipeline actually
+        # feeds this function -- and it is the dtype in which `1 + cos` is
+        # unresolvable, so testing only float64 hides the failure entirely.
+        for dtype in (np.float64, np.float32):
+            down = np.array([np.sin(t), -np.cos(t), 0.0], dtype=dtype)
+            rotation = rotation_between(down, up.astype(dtype))
 
-        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-6), tilt_deg
-        assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-6, tilt_deg
-        # It must actually flip: the result has to point up, not stay down.
-        assert float((rotation @ down)[1]) > 0.99, tilt_deg
-        assert np.linalg.norm(rotation @ down - up) < 2e-3, tilt_deg
+            assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9), (tilt_deg, dtype)
+            assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-9, (tilt_deg, dtype)
+            # It must actually flip: the result has to point up, not stay down.
+            assert float((rotation @ down.astype(np.float64))[1]) > 0.99, (tilt_deg, dtype)
+            assert np.linalg.norm(
+                rotation @ down.astype(np.float64) - up
+            ) < 1e-7, (tilt_deg, dtype)
 
 
 def test_rotation_between_fuzz_near_antiparallel():
@@ -194,18 +201,57 @@ def test_rotation_between_fuzz_near_antiparallel():
     worst = 0.0
     for _ in range(3000):
         a = rng.normal(size=3)
-        # Concentrate samples in the ill-conditioned region.
-        b = -a + rng.normal(size=3) * 10 ** rng.uniform(-14, -1)
+        # Concentrate samples in the ill-conditioned region, and run each one
+        # through both dtypes.
+        b = -a + rng.normal(size=3) * 10 ** rng.uniform(-18, -1)
+        for dtype in (np.float64, np.float32):
+            # Compare against the vectors the function was actually handed.
+            # Measuring a float32 call against float64 ground truth measures
+            # the input rounding (float32 eps ~ 1.2e-7), not the algorithm.
+            given_a = a.astype(dtype).astype(np.float64)
+            given_b = b.astype(dtype).astype(np.float64)
+            rotation = rotation_between(a.astype(dtype), b.astype(dtype))
+            assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-9
+            assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-9)
+            worst = max(
+                worst,
+                np.linalg.norm(
+                    rotation @ (given_a / np.linalg.norm(given_a))
+                    - given_b / np.linalg.norm(given_b)
+                ),
+            )
+    # Bounded by the sqrt(eps) cutoff below which a half turn is substituted.
+    assert worst < 2e-8, f"worst mapping error {worst:.2e}"
+
+
+def test_rotation_between_is_scale_and_dtype_invariant():
+    """Magnitude and dtype must not change the answer."""
+    a = np.array([0.3, -0.9, 0.2])
+    b = np.array([-0.4, 0.1, 0.8])
+    reference = rotation_between(a, b)
+    for scale in (1e-13, 1e-3, 1.0, 1e3, 1e200):
+        assert np.allclose(rotation_between(a * scale, b), reference, atol=1e-9), scale
+        assert np.allclose(rotation_between(a, b * scale), reference, atol=1e-9), scale
+    assert np.allclose(
+        rotation_between(a.astype(np.float32), b.astype(np.float32)),
+        reference, atol=1e-6,
+    )
+
+
+def test_rotation_between_is_continuous_through_the_band():
+    """Two nearly identical inputs must not give wildly different rotations.
+
+    Substituting a half turn about a *fixed* helper axis made the result jump
+    by 180 degrees of yaw for a 2e-6 rad change of input.
+    """
+    a = np.array([0.0, 1.0, 0.0])
+    previous = None
+    for delta in np.linspace(1.0e-4, 2.0e-4, 25):
+        b = -a + np.array([delta, 0.0, 0.0])
         rotation = rotation_between(a, b)
-        assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-5
-        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-5)
-        worst = max(
-            worst,
-            np.linalg.norm(
-                rotation @ (a / np.linalg.norm(a)) - b / np.linalg.norm(b)
-            ),
-        )
-    assert worst < 2e-3, f"worst mapping error {worst:.2e}"
+        if previous is not None:
+            assert np.linalg.norm(rotation - previous) < 1e-3
+        previous = rotation
 
 
 def test_estimate_up_refuses_rank_deficient_walls():

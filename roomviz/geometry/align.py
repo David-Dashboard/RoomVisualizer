@@ -36,39 +36,72 @@ def rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     camera is held straight, so getting it wrong turns the whole room upside
     down.
     """
-    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
-    if norm_a < 1e-12 or norm_b < 1e-12:
+    # Promote to float64 before anything else.  Callers routinely hand this
+    # float32 arrays - `fit_plane_lsq` on a float32 cloud returns a float32
+    # normal - and the near-antiparallel case hinges on a quantity that float32
+    # simply cannot resolve, so working in the input dtype silently returns a
+    # matrix that is not a rotation at all.
+    a = np.asarray(a, dtype=np.float64).reshape(3)
+    b = np.asarray(b, dtype=np.float64).reshape(3)
+
+    # Scale down before taking norms so that huge inputs cannot overflow the
+    # sum of squares to inf (which would normalise to zero and yield identity).
+    scale_a = np.abs(a).max()
+    scale_b = np.abs(b).max()
+    if scale_a == 0.0 or scale_b == 0.0:
         return np.eye(3)
-    # Normalise by the true norm.  Adding an epsilon here perturbs the dot
-    # product by more than the true value of `1 + c` in the antiparallel band.
-    a = a / norm_a
-    b = b / norm_b
+    a = a / scale_a
+    b = b / scale_b
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
 
-    c = float(np.clip(a @ b, -1.0, 1.0))
+    cross = np.cross(a, b)
+    sin_theta = float(np.linalg.norm(cross))
+    cos_theta = float(a @ b)
 
-    # Antiparallel (or close enough that Rodrigues is ill-conditioned): rotate
-    # by 180 degrees about any axis perpendicular to `a`.  The threshold trades
-    # two errors against each other - too large and the exact-180 substitution
-    # is a poor approximation, too small and Rodrigues returns a matrix that is
-    # not orthogonal.  Measured worst case over 40k antiparallel-biased samples:
-    # 1e-6 -> 1.4e-3 rad off / 1e-9 non-orthogonality; 1e-8 -> 1.4e-4 / 1e-7;
-    # 1e-12 -> 4.8e-4 / 8.9e-4.  1e-8 minimises the worse of the two.
-    if 1.0 + c < 1e-8:
+    # Axis-angle rather than the `1 / (1 + cos)` form of Rodrigues.  That
+    # denominator vanishes as the vectors approach antiparallel, which is
+    # precisely the case that matters here (a level camera's floor normal is
+    # antiparallel to world up), and no choice of threshold for switching away
+    # from it is both accurate and well-conditioned.  `atan2` stays accurate
+    # across the whole range, including at pi, so there is no constant to tune.
+    theta = np.arctan2(sin_theta, cos_theta)
+
+    # Below sqrt(machine epsilon) the cross product's *direction* is rounding
+    # noise: its magnitude is at the level of the error in computing it, so the
+    # normalised axis points somewhere arbitrary and is no longer perpendicular
+    # to `a`.  Substituting an exact half turn about a deliberately chosen
+    # perpendicular is then both safer and no less accurate - the substitution
+    # error is itself bounded by sin_theta, i.e. by the same cutoff.  Balancing
+    # the two error terms at sqrt(eps) is what fixes the constant; it is not a
+    # tuned value.
+    if sin_theta < 1.5e-8:
+        if cos_theta > 0.0:
+            return np.eye(3)
         helper = np.array([1.0, 0.0, 0.0])
         if abs(float(a @ helper)) > 0.9:
             helper = np.array([0.0, 1.0, 0.0])
         axis = np.cross(a, helper)
         axis /= np.linalg.norm(axis)
-        return -np.eye(3) + 2 * np.outer(axis, axis)
+        return 2.0 * np.outer(axis, axis) - np.eye(3)
 
-    if 1.0 - c < 1e-12:  # already parallel
-        return np.eye(3)
-
-    v = np.cross(a, b)
+    # Re-orthogonalise against `a`.  The rotation must take `a` somewhere, so
+    # any component of the axis along `a` is a pure error term.
+    axis = cross / sin_theta
+    axis -= a * float(axis @ a)
+    axis /= np.linalg.norm(axis)
     kmat = np.array(
-        [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
+        [
+            [0.0, -axis[2], axis[1]],
+            [axis[2], 0.0, -axis[0]],
+            [-axis[1], axis[0], 0.0],
+        ]
     )
-    return np.eye(3) + kmat + kmat @ kmat * (1.0 / (1.0 + c))
+    return (
+        np.eye(3)
+        + np.sin(theta) * kmat
+        + (1.0 - np.cos(theta)) * (kmat @ kmat)
+    )
 
 
 def estimate_up(
