@@ -43,11 +43,22 @@ def _room_dimensions(scene: Scene) -> dict[str, Any]:
 
 def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[str, Any]:
     counts = Counter(o.label.split(";")[0] for o in scene.objects)
+    aligned = bool(scene.meta.get("aligned", True))
+    metric = bool(scene.meta.get("metric_depth", True))
     payload: dict[str, Any] = {
         "format": "roomviz-scene",
         "version": 1,
-        "up_axis": "+Y",
-        "units": "metres",
+        # Only claim +Y when gravity alignment actually ran.  Without it the
+        # scene is still in frame 0's camera frame, where up is roughly -Y and
+        # tilted by however the camera was held - so every height, room_height
+        # and axis-aligned object size is measured along the wrong axis.
+        "up_axis": "+Y" if aligned else "unaligned (frame 0 camera)",
+        "gravity_aligned": aligned,
+        # A relative-depth checkpoint has no absolute scale; it is mapped onto
+        # an assumed near/far range, so the numbers are metres-shaped rather
+        # than measured.
+        "units": "metres" if metric else "metres (assumed scale, relative depth)",
+        "metric_depth": metric,
         "summary": {
             "point_count": int(scene.points.shape[0]),
             "object_count": len(scene.objects),
@@ -65,8 +76,11 @@ def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[st
     for inst in scene.objects:
         entry = inst.to_dict()
         entry["color"] = list(label_color(inst.label))
-        entry["node"] = object_node_name(inst)
-        entry["box_node"] = box_node_name(inst)
+        if cfg is None or cfg.export_glb:
+            # Same rule as cloud_file: never reference geometry this run did
+            # not write.
+            entry["node"] = object_node_name(inst)
+            entry["box_node"] = box_node_name(inst)
         if cfg is None or cfg.export_objects:
             # Only claim a file that this run actually writes; a dangling
             # reference is worse than none.
@@ -78,17 +92,24 @@ def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[st
     for surface in scene.surfaces:
         entry = surface.to_dict()
         entry["color"] = list(surface_color(surface.kind))
-        entry["node"] = surface_node_name(surface)
+        if cfg is None or cfg.export_glb:
+            entry["node"] = surface_node_name(surface)
         payload["surfaces"].append(entry)
 
+    source_indices = scene.meta.get("source_indices") or []
     for i, pose in enumerate(scene.poses):
-        payload["cameras"].append(
-            {
-                "frame": i,
-                "position": [round(float(v), 4) for v in pose[:3, 3]],
-                "matrix": [round(float(v), 6) for v in np.asarray(pose).reshape(-1)],
-            }
-        )
+        entry = {
+            "frame": i,
+            # Index in the original media, so a consumer can line these poses
+            # up with its own per-frame data.  Keyframe sampling means this is
+            # not the same as `frame`.
+            "source_frame": source_indices[i] if i < len(source_indices) else None,
+            "position": [round(float(v), 4) for v in pose[:3, 3]],
+            # Camera-to-world, ROW-major (numpy order).  Note glTF uses
+            # column-major, so scene.glb and this field are transposes.
+            "matrix_row_major": [round(float(v), 6) for v in np.asarray(pose).reshape(-1)],
+        }
+        payload["cameras"].append(entry)
 
     if scene.intrinsics is not None:
         payload["intrinsics"] = scene.intrinsics.to_dict()

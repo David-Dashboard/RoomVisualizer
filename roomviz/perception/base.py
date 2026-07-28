@@ -1,7 +1,7 @@
 """Backend protocols and registry for the perception stage.
 
 Depth and segmentation are pluggable so that the geometry half of the pipeline
-can be exercised with ground-truth inputs (see :mod:`roomviz.perception.oracle`)
+can be exercised with ground-truth inputs (see :mod:`roomviz.perception.precomputed`)
 and so that swapping in a different checkpoint is a one-line change.
 """
 

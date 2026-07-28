@@ -431,6 +431,8 @@ def fuse(observations: list[Observation], cfg: PipelineConfig) -> Scene:
         meta={
             "frames": len(observations),
             "aligned": bool(cfg.align_gravity),
+            "metric_depth": all(o.depth.metric for o in observations),
+            "source_indices": [o.frame.source_index for o in observations],
             "voxel_size": cfg.voxel_size,
         },
     )

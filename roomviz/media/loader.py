@@ -66,15 +66,24 @@ def classify(path: Path) -> MediaSource:
 
 
 def resize_frame(rgb: np.ndarray, max_side: int) -> np.ndarray:
-    """Downscale so the longest side is at most ``max_side``.
+    """Resize so the longest side is at most ``max_side``.
 
     Dimensions are snapped to multiples of 14, which keeps ViT-based depth
-    backbones (patch size 14) from silently resampling the image.
+    backbones (patch size 14) from silently resampling the image.  That snap
+    means the aspect ratio can shift by up to a percent or so, and a small
+    image may be scaled *up* slightly - intrinsics are rescaled per axis to
+    match (see `resolve_intrinsics`), so geometry is unaffected.
     """
     h, w = rgb.shape[:2]
     scale = min(1.0, max_side / float(max(h, w)))
-    new_w = max(14, int(round(w * scale / 14)) * 14)
-    new_h = max(14, int(round(h * scale / 14)) * 14)
+    # Round the long side *down* to a patch multiple so the cap is honoured -
+    # rounding to nearest could exceed it (1920x1080 at max_side 768 gave 770).
+    if w >= h:
+        new_w = max(14, int(w * scale // 14) * 14)
+        new_h = max(14, int(round(h * scale / 14)) * 14)
+    else:
+        new_h = max(14, int(h * scale // 14) * 14)
+        new_w = max(14, int(round(w * scale / 14)) * 14)
     if (new_w, new_h) == (w, h):
         return rgb
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR

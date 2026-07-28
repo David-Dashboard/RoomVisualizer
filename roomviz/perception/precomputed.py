@@ -31,7 +31,41 @@ _DEPTH_SUFFIXES = (".npy", ".exr", ".tiff", ".tif", ".png")
 _SEG_SUFFIXES = (".npy", ".png")
 
 
-def _find_for_frame(directory: Path, index: int, suffixes: tuple[str, ...]) -> Path:
+def check_sidecar_numbering(directory: Path, suffixes: tuple[str, ...]) -> None:
+    """Refuse a sidecar set that is numbered from 1 instead of 0.
+
+    A 1-indexed export is the single most damaging mistake here and the least
+    visible: every frame after the first finds a file with the *right name*
+    holding the *previous* frame's data, so nothing warns and the geometry is
+    quietly wrong.  It is also trivially detectable - index 0 missing while
+    index 1 and the following run contiguously.
+    """
+    numbered = {}
+    for path in directory.iterdir():
+        if path.suffix.lower() not in suffixes:
+            continue
+        try:
+            numbered[int(path.stem)] = path
+        except ValueError:
+            continue
+    if not numbered or 0 in numbered:
+        return
+    if 1 in numbered and len(numbered) >= 2 and max(numbered) == len(numbered):
+        raise ValueError(
+            f"{directory} appears to be numbered from 1 ({min(numbered)}..."
+            f"{max(numbered)}) but sidecars are matched to source frame indices, "
+            f"which start at 0. Every frame would be paired with the previous "
+            f"frame's data. Renumber from 000000, or pass --frame-stride to "
+            f"match your export."
+        )
+
+
+def _find_for_frame(
+    directory: Path,
+    index: int,
+    suffixes: tuple[str, ...],
+    expected_count: int | None = None,
+) -> Path:
     """Locate the sidecar for an *original media* frame index.
 
     Sidecars are numbered against the source video or image folder, not
@@ -48,35 +82,46 @@ def _find_for_frame(directory: Path, index: int, suffixes: tuple[str, ...]) -> P
     files = sorted(p for p in directory.iterdir() if p.suffix.lower() in suffixes)
     if index < len(files):
         # Nothing is numbered for this frame, so fall back to sorted position.
-        # That is a guess: a single stray file in the directory shifts every
-        # pairing by one and fuses each frame's colour with another's depth,
-        # which looks entirely plausible in the output.  Say so.
-        log.warning(
-            "%s has no sidecar named %06d; falling back to sorted position -> %s. "
-            "Number the sidecars by source frame index to make this exact.",
-            directory, index, files[index].name,
-        )
+        # That is a guess: a stray file shifts every pairing by one and fuses
+        # each frame's colour with another's depth, which looks entirely
+        # plausible in the output.  Only say so when the guess is actually in
+        # play -- warning on a directory that is simply named differently but
+        # ordered correctly is noise, and noise is what gets warnings ignored.
+        risky = expected_count is not None and len(files) != expected_count
+        if risky:
+            log.warning(
+                "%s has no sidecar named %06d and holds %d files for %d frames; "
+                "falling back to sorted position -> %s. Number the sidecars by "
+                "source frame index to make this exact.",
+                directory, index, len(files), expected_count, files[index].name,
+            )
+        else:
+            log.debug(
+                "%s: no file named %06d; using sorted position -> %s",
+                directory, index, files[index].name,
+            )
         return files[index]
     raise FileNotFoundError(f"no sidecar for frame {index} in {directory}")
 
 
-def _warn_on_aspect_change(
-    kind: str, got: tuple[int, int], want: tuple[int, int]
-) -> None:
+def _warn_on_aspect_change(kind: str, got: tuple[int, int], frame: Frame) -> None:
     """Warn when a sidecar is being stretched, not merely rescaled.
 
-    Resizing to the frame is normal and harmless at a matching aspect ratio.
-    Stretching a transposed or differently-shaped map produces a reconstruction
-    of a *different room* that looks entirely plausible, so it must not be
-    silent.
+    The comparison is against the *original capture* size, not the working
+    frame size.  The loader snaps the working size to a multiple of the model
+    patch size, so a 640x480 sidecar against a 644x476 frame differs in aspect
+    by 1.5% through no fault of the user - and warning about it fires on the
+    documented quickstart, twice per frame, which is how people learn to
+    ignore the identical warning when it correctly catches transposed depth.
     """
+    reference = frame.original_size or (frame.width, frame.height)
     got_ratio = got[1] / max(got[0], 1)
-    want_ratio = want[1] / max(want[0], 1)
-    if abs(got_ratio - want_ratio) > 0.01 * want_ratio:
+    want_ratio = reference[0] / max(reference[1], 1)
+    if abs(got_ratio - want_ratio) > 0.02 * want_ratio:
         log.warning(
-            "%s sidecar is %dx%d but the frame is %dx%d - a different aspect "
+            "%s sidecar is %dx%d but the capture is %dx%d - a different aspect "
             "ratio, so it is being stretched; the reconstruction will be wrong",
-            kind, got[1], got[0], want[1], want[0],
+            kind, got[1], got[0], reference[0], reference[1],
         )
 
 
@@ -159,17 +204,33 @@ class FileDepthBackend:
         self.dir = Path(cfg.depth_dir)
         if not self.dir.is_dir():
             raise NotADirectoryError(self.dir)
+        check_sidecar_numbering(self.dir, _DEPTH_SUFFIXES)
+        self._expected_count: int | None = None
+        self._warned_float_scale = False
 
     def predict(self, frame: Frame) -> DepthMap:
-        path = _find_for_frame(self.dir, frame.source_index, _DEPTH_SUFFIXES)
+        path = _find_for_frame(
+            self.dir, frame.source_index, _DEPTH_SUFFIXES, self._expected_count
+        )
         raw = _load_array(path)
         depth = raw.astype(np.float32)
         if np.issubdtype(raw.dtype, np.integer):
             # Integer depth is conventionally millimetres; depth_scale converts
             # stored units to metres.
             depth *= float(self.cfg.depth_scale)
+        elif self.cfg.depth_scale != 0.001 and not self._warned_float_scale:
+            # Float sidecars are assumed to be metres already.  Silently
+            # ignoring an explicitly-passed scale is how a millimetre float
+            # export becomes a five-kilometre room with no error.
+            log.warning(
+                "--depth-scale %g is ignored for floating-point sidecars (%s is "
+                "%s); float depth is read as metres. Convert to metres, or "
+                "store integer units.",
+                self.cfg.depth_scale, path.name, raw.dtype,
+            )
+            self._warned_float_scale = True
         if depth.shape != (frame.height, frame.width):
-            _warn_on_aspect_change("depth", depth.shape, (frame.height, frame.width))
+            _warn_on_aspect_change("depth", depth.shape, frame)
             depth = cv2.resize(
                 depth, (frame.width, frame.height), interpolation=cv2.INTER_NEAREST
             )
@@ -195,6 +256,8 @@ class FileSegmentationBackend:
         self.dir = Path(cfg.seg_dir)
         if not self.dir.is_dir():
             raise NotADirectoryError(self.dir)
+        check_sidecar_numbering(self.dir, _SEG_SUFFIXES)
+        self._expected_count: int | None = None
         labels_path = self.dir / "labels.json"
         self.labels: dict[int, object] = {}
         if labels_path.exists():
@@ -203,10 +266,12 @@ class FileSegmentationBackend:
             log.warning("%s has no labels.json; segments will be unlabelled", self.dir)
 
     def predict(self, frame: Frame) -> Segmentation:
-        path = _find_for_frame(self.dir, frame.source_index, _SEG_SUFFIXES)
+        path = _find_for_frame(
+            self.dir, frame.source_index, _SEG_SUFFIXES, self._expected_count
+        )
         ids = _load_array(path).astype(np.int32)
         if ids.shape != (frame.height, frame.width):
-            _warn_on_aspect_change("segmentation", ids.shape, (frame.height, frame.width))
+            _warn_on_aspect_change("segmentation", ids.shape, frame)
             ids = cv2.resize(
                 ids, (frame.width, frame.height), interpolation=cv2.INTER_NEAREST
             )
