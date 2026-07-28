@@ -131,12 +131,22 @@ model, so depth comes out in metres. That is what makes the camera odometry,
 the fused geometry and the reported object dimensions all consistent with one
 another. Relative checkpoints work too, but their absolute scale is a guess.
 
-**The segmenter's instance decision is authoritative; the 3D split is not.**
-Panoptic "stuff" classes return one mask per class, so several objects can
-arrive as a single segment — those get split apart in 3D. A "thing" mask
-already covers exactly one object and is never split, so an object an occluder
-cut in two on screen stays one object. Where two clusters came from one mask,
-they may be rejoined later if another view connects them; where they came from
+**The segmenter's instance decision sets a threshold, not a veto.** Panoptic
+"stuff" classes return one mask per class, so several objects can arrive as a
+single segment — those get split apart in 3D. A "thing" mask is split too, but
+only across a wide, unoccluded gap: the model calling it one object buys
+reluctance, not immunity. Making that a veto meant three paintings sharing one
+mask reconstructed as a single 3.6 m object, and whether they did depended on
+whether the word "painting" appeared in a hand-typed list — so the list is now
+a hint consulted only when the segmenter offers no flag of its own, and it can
+only move the split distance, never switch splitting off.
+
+Distance alone cannot carry that decision, because an occluder's shadow is
+routinely *wider* than the space between two genuinely separate objects. So
+every candidate split is checked back against the image: if the pixels between
+two pieces belong to a nearer surface, they are one object seen past an
+obstruction, and are rejoined. Where two clusters came from one mask, they may
+also be rejoined later if another view connects them; where they came from
 different masks in the same frame, they are never merged, however close
 together they sit.
 

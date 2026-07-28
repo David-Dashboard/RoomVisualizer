@@ -209,6 +209,14 @@ class ObjectInstance:
     observations: int = 1
     frame_indices: list[int] = field(default_factory=list)
 
+    split_gap: float = 0.0
+    """The empty distance (m) at which this instance was parted from its
+    siblings during the per-frame 3D split, or 0 if it was never split.
+
+    Carried so that a merge can be undone at the same distance that justified
+    it: a mask split at 30 cm must be rejoinable at 30 cm.  0 means "use the
+    caller's default gap"."""
+
     sources: list[tuple[int, int]] = field(default_factory=list)
     """``(frame_index, segment_id)`` pairs this instance was built from.
 

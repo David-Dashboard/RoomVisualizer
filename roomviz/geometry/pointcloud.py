@@ -191,6 +191,14 @@ def voxel_overlap(a: np.ndarray, b: np.ndarray, voxel: float) -> float:
     view to 0.19 by the eighth, and the object splits in two purely because of
     how much had been seen already.  Intersection-over-minimum asks the
     question that actually matters - is this view contained in what we have?
+
+    **It saturates, and callers ranking candidates must account for that.**
+    Anything fully contained scores exactly 1.0 regardless of size disparity,
+    so a three-voxel sliver ties with a perfect match against a 600-voxel
+    model and can outrank a genuine 0.8 elsewhere.  This function deliberately
+    stays the plain measure; the fusion stage wraps it in
+    ``roomviz.fusion.scene_fusion._containment``, which floors the denominator
+    at a share of the *larger* set and is what association should use.
     """
     if a.shape[0] == 0 or b.shape[0] == 0:
         return 0.0

@@ -81,6 +81,35 @@ class Mask2FormerBackend:
         self.id2label = {
             int(k): v for k, v in getattr(self.model.config, "id2label", {}).items()
         }
+        self.thing_ids = self._thing_ids()
+
+    def _thing_ids(self) -> frozenset[int] | None:
+        """Class ids the checkpoint itself calls "things", if it says.
+
+        This matters more than it looks.  Downstream, ``Segment.is_thing``
+        decides how wide a gap has to be before one mask is split into several
+        objects, and the fallback when it is ``None`` is a hand-curated word
+        list - which is complete for nothing and can only ever be a hint.  A
+        checkpoint that ships the real table should be believed instead.
+
+        OneFormer's processor builds one: ``prepare_metadata`` reads the
+        published per-class ``isthing`` flags into ``metadata["thing_ids"]``.
+        Mask2Former ships no equivalent - its config carries ``id2label`` and
+        nothing more - so for that checkpoint this returns ``None`` and the
+        word list takes over.  Neither branch has been executed against real
+        weights (see "Verification" in the README); the OneFormer branch is
+        written against the processor's published metadata contract.
+        """
+        metadata = getattr(self.processor, "metadata", None)
+        ids = metadata.get("thing_ids") if isinstance(metadata, dict) else None
+        if not ids:
+            log.info(
+                "%s exposes no thing/stuff table; falling back to the curated "
+                "word list, which only affects how readily a mask is split",
+                self.cfg.seg_model,
+            )
+            return None
+        return frozenset(int(i) for i in ids)
 
     def predict(self, frame: Frame) -> Segmentation:
         torch = self._torch
@@ -109,7 +138,13 @@ class Mask2FormerBackend:
                     role=role,
                     score=float(info.get("score", 1.0)),
                     structure_kind=kind,
-                    is_thing=is_thing(label),
+                    # The checkpoint's own table wins where it exists; the word
+                    # list is consulted only when it does not.
+                    is_thing=(
+                        label_id in self.thing_ids
+                        if self.thing_ids is not None
+                        else is_thing(label)
+                    ),
                 )
             )
 
