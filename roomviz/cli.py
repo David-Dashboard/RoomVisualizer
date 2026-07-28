@@ -60,6 +60,12 @@ def _add_reconstruct_args(parser: argparse.ArgumentParser) -> None:
                        help="precomputed segment maps (for --seg-backend file)")
     group.add_argument("--depth-scale", type=float, default=defaults.depth_scale,
                        help="integer sidecar depth units to metres (default mm)")
+    group.add_argument("--depth-near", type=float, default=defaults.depth_near,
+                       help="nearest depth in metres assumed for a relative "
+                            "(non-metric) checkpoint")
+    group.add_argument("--depth-far", type=float, default=defaults.depth_far,
+                       help="farthest depth in metres assumed for a relative "
+                            "(non-metric) checkpoint")
 
     group = parser.add_argument_group("reconstruction")
     group.add_argument("--voxel", type=float, default=defaults.voxel_size,
@@ -113,6 +119,8 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
         depth_dir=args.depth_dir,
         seg_dir=args.seg_dir,
         depth_scale=args.depth_scale,
+        depth_near=args.depth_near,
+        depth_far=args.depth_far,
         depth_trunc=args.depth_trunc,
         depth_min=args.depth_min,
         voxel_size=args.voxel,
@@ -233,6 +241,15 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
+    except ValueError as exc:
+        # Bad configuration, unreadable sidecars, or input that yielded no
+        # usable geometry.  These already carry actionable messages; what they
+        # must not do is reach the user as a traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     scene = result.scene
     print()

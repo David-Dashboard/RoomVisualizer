@@ -67,7 +67,12 @@ def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[st
         entry["color"] = list(label_color(inst.label))
         entry["node"] = object_node_name(inst)
         entry["box_node"] = box_node_name(inst)
-        entry["cloud_file"] = f"objects/{inst.instance_id:03d}_{safe_label(inst.label)}.ply"
+        if cfg is None or cfg.export_objects:
+            # Only claim a file that this run actually writes; a dangling
+            # reference is worse than none.
+            entry["cloud_file"] = (
+                f"objects/{inst.instance_id:03d}_{safe_label(inst.label)}.ply"
+            )
         payload["objects"].append(entry)
 
     for surface in scene.surfaces:

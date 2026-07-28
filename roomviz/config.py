@@ -54,6 +54,15 @@ class PipelineConfig:
     depth_scale: float = 0.001
     """Multiplier converting integer sidecar depth to metres (mm -> m)."""
 
+    depth_near: float = 0.4
+    """Nearest depth (m) assumed when a *relative* checkpoint is used.
+
+    Relative checkpoints emit disparity with no absolute scale, so a range has
+    to be assumed to turn it into metres.  Ignored by metric checkpoints."""
+
+    depth_far: float = 10.0
+    """Farthest depth (m) assumed when a relative checkpoint is used."""
+
     # ---- reconstruction --------------------------------------------------
     depth_trunc: float = 12.0
     """Ignore depth beyond this many metres (kills sky/window blowouts)."""
@@ -104,6 +113,56 @@ class PipelineConfig:
     seed: int = 0
 
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        """Reject settings that would silently produce nonsense.
+
+        Without this, `--hfov 0` divides by tan(0) and writes a literal
+        `Infinity` into scene.json (which is not valid JSON, so the viewer
+        cannot load it), and `--voxel 0` collapses the entire cloud into a
+        single point - both reported as a successful run.
+        """
+        import math
+
+        def positive(name: str, value: float) -> None:
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a positive finite number, got {value!r}")
+
+        if not 0.0 < self.hfov_deg < 180.0:
+            raise ValueError(
+                f"hfov must be between 0 and 180 degrees, got {self.hfov_deg!r}"
+            )
+        positive("voxel_size", self.voxel_size)
+        positive("depth_trunc", self.depth_trunc)
+        positive("max_side", self.max_side)
+        if self.depth_min < 0 or not math.isfinite(self.depth_min):
+            raise ValueError(f"depth_min must be >= 0, got {self.depth_min!r}")
+        if self.depth_min >= self.depth_trunc:
+            raise ValueError(
+                f"depth_min ({self.depth_min}) must be below depth_trunc "
+                f"({self.depth_trunc})"
+            )
+        if self.max_frames < 1:
+            raise ValueError(f"max_frames must be at least 1, got {self.max_frames!r}")
+        if self.point_budget < 1:
+            raise ValueError(f"point_budget must be at least 1, got {self.point_budget!r}")
+        if self.min_object_points < 1:
+            raise ValueError("min_object_points must be at least 1")
+        if self.object_split_gap <= 0 or not math.isfinite(self.object_split_gap):
+            raise ValueError("object_split_gap must be a positive finite number")
+        positive("depth_near", self.depth_near)
+        positive("depth_far", self.depth_far)
+        if self.depth_near >= self.depth_far:
+            raise ValueError(
+                f"depth_near ({self.depth_near}) must be below depth_far "
+                f"({self.depth_far})"
+            )
+        if self.intrinsics is not None:
+            fx, fy, cx, cy = self.intrinsics
+            positive("intrinsics fx", fx)
+            positive("intrinsics fy", fy)
+            if not (math.isfinite(cx) and math.isfinite(cy)):
+                raise ValueError("intrinsics cx/cy must be finite")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

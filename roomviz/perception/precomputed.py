@@ -47,8 +47,92 @@ def _find_for_frame(directory: Path, index: int, suffixes: tuple[str, ...]) -> P
 
     files = sorted(p for p in directory.iterdir() if p.suffix.lower() in suffixes)
     if index < len(files):
+        # Nothing is numbered for this frame, so fall back to sorted position.
+        # That is a guess: a single stray file in the directory shifts every
+        # pairing by one and fuses each frame's colour with another's depth,
+        # which looks entirely plausible in the output.  Say so.
+        log.warning(
+            "%s has no sidecar named %06d; falling back to sorted position -> %s. "
+            "Number the sidecars by source frame index to make this exact.",
+            directory, index, files[index].name,
+        )
         return files[index]
     raise FileNotFoundError(f"no sidecar for frame {index} in {directory}")
+
+
+def _warn_on_aspect_change(
+    kind: str, got: tuple[int, int], want: tuple[int, int]
+) -> None:
+    """Warn when a sidecar is being stretched, not merely rescaled.
+
+    Resizing to the frame is normal and harmless at a matching aspect ratio.
+    Stretching a transposed or differently-shaped map produces a reconstruction
+    of a *different room* that looks entirely plausible, so it must not be
+    silent.
+    """
+    got_ratio = got[1] / max(got[0], 1)
+    want_ratio = want[1] / max(want[0], 1)
+    if abs(got_ratio - want_ratio) > 0.01 * want_ratio:
+        log.warning(
+            "%s sidecar is %dx%d but the frame is %dx%d - a different aspect "
+            "ratio, so it is being stretched; the reconstruction will be wrong",
+            kind, got[1], got[0], want[1], want[0],
+        )
+
+
+def _parse_labels(path: Path) -> dict[int, object]:
+    """Read and validate a ``labels.json`` sidecar.
+
+    Everything here is user-authored, usually by an export script, so each
+    failure mode gets a message naming the file and the offending key rather
+    than a traceback from deep inside the loader.
+    """
+    try:
+        raw = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{path} is not valid JSON: {exc}") from None
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{path} must be an object mapping segment id -> label, "
+            f"got {type(raw).__name__}"
+        )
+
+    labels: dict[int, object] = {}
+    for key, value in raw.items():
+        try:
+            segment_id = int(str(key).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"{path}: segment id {key!r} is not an integer") from None
+        if segment_id in labels:
+            # "12", " 12" and "012" all parse to the same id; silently keeping
+            # the last would relabel a segment for no visible reason.
+            raise ValueError(f"{path}: segment id {segment_id} appears more than once")
+
+        if isinstance(value, str):
+            labels[segment_id] = value
+            continue
+        if isinstance(value, dict):
+            label = value.get("label")
+            if not isinstance(label, str):
+                raise ValueError(
+                    f"{path}: segment {segment_id} has a non-string 'label' "
+                    f"({label!r})"
+                )
+            thing = value.get("thing")
+            if thing is not None and not isinstance(thing, bool):
+                # A JSON string "false" is truthy in Python, so accepting one
+                # would mean the exact opposite of what the file says.
+                raise ValueError(
+                    f"{path}: segment {segment_id} has a non-boolean 'thing' "
+                    f"({thing!r}); use true or false"
+                )
+            labels[segment_id] = {"label": label, "thing": thing}
+            continue
+        raise ValueError(
+            f"{path}: segment {segment_id} must map to a string or an object, "
+            f"got {type(value).__name__}"
+        )
+    return labels
 
 
 def _load_array(path: Path) -> np.ndarray:
@@ -85,6 +169,7 @@ class FileDepthBackend:
             # stored units to metres.
             depth *= float(self.cfg.depth_scale)
         if depth.shape != (frame.height, frame.width):
+            _warn_on_aspect_change("depth", depth.shape, (frame.height, frame.width))
             depth = cv2.resize(
                 depth, (frame.width, frame.height), interpolation=cv2.INTER_NEAREST
             )
@@ -113,7 +198,7 @@ class FileSegmentationBackend:
         labels_path = self.dir / "labels.json"
         self.labels: dict[int, object] = {}
         if labels_path.exists():
-            self.labels = {int(k): v for k, v in json.loads(labels_path.read_text()).items()}
+            self.labels = _parse_labels(labels_path)
         else:
             log.warning("%s has no labels.json; segments will be unlabelled", self.dir)
 
@@ -121,6 +206,7 @@ class FileSegmentationBackend:
         path = _find_for_frame(self.dir, frame.source_index, _SEG_SUFFIXES)
         ids = _load_array(path).astype(np.int32)
         if ids.shape != (frame.height, frame.width):
+            _warn_on_aspect_change("segmentation", ids.shape, (frame.height, frame.width))
             ids = cv2.resize(
                 ids, (frame.width, frame.height), interpolation=cv2.INTER_NEAREST
             )

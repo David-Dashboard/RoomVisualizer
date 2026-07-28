@@ -35,10 +35,15 @@ def _require_trimesh():
     return trimesh
 
 
-def safe_label(label: str) -> str:
-    """First synonym of a class name, reduced to name-safe characters."""
+def safe_label(label: str, max_length: int = 48) -> str:
+    """First synonym of a class name, reduced to name-safe characters.
+
+    Length-capped because this doubles as a filename component: a checkpoint
+    with a pathological class name would otherwise raise ENAMETOOLONG at the
+    very end of a run, after the rest of the output had already been written.
+    """
     first = label.split(";")[0].strip() or "object"
-    return re.sub(r"[^A-Za-z0-9-]+", "_", first)
+    return re.sub(r"[^A-Za-z0-9-]+", "_", first)[:max_length] or "object"
 
 
 def object_node_name(inst: ObjectInstance) -> str:

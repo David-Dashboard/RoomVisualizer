@@ -77,15 +77,18 @@ def structure_kind(label: str) -> str | None:
     return None
 
 
-def classify(label: str, is_thing: bool | None = None) -> tuple[str, str | None]:
+def classify(label: str) -> tuple[str, str | None]:
     """Classify a segmentation label.
 
     Returns ``(role, structure_kind)`` where role is one of
     :data:`ROLE_OBJECT`, :data:`ROLE_STRUCTURE`, :data:`ROLE_IGNORE`.
 
-    ``is_thing`` comes from the checkpoint's panoptic metadata when available.
-    It is only advisory: ADE20K marks rugs and curtains as "stuff" but we still
-    want a curtain to be an object you can toggle in the viewer.
+    Thing/stuff metadata deliberately plays no part here: it decides whether a
+    mask may be *split*, not what the mask is.  ADE20K marks rugs and curtains
+    as stuff, and a curtain is still an object you want to toggle in the
+    viewer.  (An earlier signature took an ``is_thing`` argument that the body
+    never read, and whose name shadowed the module-level :func:`is_thing`
+    inside this scope - a trap for anyone who tried to start using it.)
     """
     names = set(synonyms(label))
     kind = structure_kind(label)

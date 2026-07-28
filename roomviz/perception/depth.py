@@ -71,15 +71,24 @@ class DepthAnythingBackend:
         self.model.to(self.device).eval()
 
         est_type = getattr(self.model.config, "depth_estimation_type", None)
-        self.metric = (
-            est_type == "metric" if est_type is not None else "metric" in str(source).lower()
-        )
+        if est_type is not None:
+            self.metric = est_type == "metric"
+        else:
+            # Fall back to the checkpoint *name*, and only its last component:
+            # matching the whole string would call a relative model metric
+            # merely because it sat in a directory called "metric-cache".
+            self.metric = "metric" in str(source).rstrip("/").split("/")[-1].lower()
+            log.warning(
+                "%s does not declare depth_estimation_type; guessing %s from "
+                "its name. Pass --depth-near/--depth-far if the scale looks wrong.",
+                source, "metric" if self.metric else "relative",
+            )
         if not self.metric:
             log.warning(
                 "%s is a relative-depth checkpoint; absolute scale will be "
-                "approximated from --depth-near/--depth-far. Prefer a metric "
-                "indoor checkpoint for measurable output.",
-                source,
+                "assumed as %.2f-%.2f m (--depth-near/--depth-far). Prefer a "
+                "metric indoor checkpoint for measurable output.",
+                source, cfg.depth_near, cfg.depth_far,
             )
 
     def predict(self, frame: Frame) -> DepthMap:
@@ -107,9 +116,9 @@ class DepthAnythingBackend:
         depth = np.squeeze(depth)
 
         if not self.metric:
-            near = float(self.cfg.extra.get("depth_near", 0.4))
-            far = float(self.cfg.extra.get("depth_far", self.cfg.depth_trunc))
-            depth = _relative_to_metric(depth, near=near, far=far)
+            depth = _relative_to_metric(
+                depth, near=self.cfg.depth_near, far=self.cfg.depth_far
+            )
 
         depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
         depth[depth < self.cfg.depth_min] = 0.0

@@ -47,7 +47,6 @@ VIEWER_HTML = """<!doctype html>
   .obj { display: flex; align-items: center; gap: 8px; padding: 4px 6px;
     border-radius: 6px; cursor: pointer; }
   .obj:hover { background: #1e2431; }
-  .obj.dim { opacity: .4; }
   .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
   .obj .name { flex: 1; overflow: hidden; text-overflow: ellipsis;
     white-space: nowrap; }
@@ -58,7 +57,7 @@ VIEWER_HTML = """<!doctype html>
   #error { position: absolute; inset: 0; display: none; place-content: center;
     padding: 40px; text-align: center; color: var(--muted); z-index: 20; }
   #error code { color: var(--accent); }
-  @media (max-width: 720px) {
+  @media (max-width: 720px), (max-height: 560px) {
     /* Scroll the whole panel rather than only the object list: at phone
        heights the fixed groups leave the list a couple of rows tall, so its
        own scrollbar is not enough to reach the objects comfortably. */
@@ -102,6 +101,40 @@ VIEWER_HTML = """<!doctype html>
   <div id="objects"></div>
 </aside>
 
+<script>
+// Deliberately a classic script, and deliberately before the importmap: a
+// module's *import statements* are resolved before its body runs, so on
+// file:// the imports fail with a CORS error and nothing inside the module
+// ever executes -- including any guard written at the top of it.  Only a
+// non-module script can report this.
+if (location.protocol === 'file:') {
+  document.getElementById('reason').textContent =
+    'Opened from the filesystem. Browsers block loading JavaScript modules ' +
+    'over file://, so this page must be served over HTTP.';
+  document.getElementById('error').style.display = 'grid';
+  document.getElementById('stats').textContent = 'not served over HTTP';
+} else {
+  // If the module never gets as far as rendering, say so rather than sitting
+  // on "loading..." forever (a missing vendor/ directory does exactly that).
+  window.addEventListener('error', (e) => {
+    if (e.target && e.target.tagName === 'SCRIPT') {
+      document.getElementById('reason').textContent =
+        'Could not load ' + (e.target.src || 'a script') + '.';
+      document.getElementById('error').style.display = 'grid';
+      document.getElementById('stats').textContent = 'load failed';
+    }
+  }, true);
+  setTimeout(() => {
+    if (!window.roomviz &&
+        document.getElementById('stats').textContent.startsWith('loading')) {
+      document.getElementById('reason').textContent =
+        'The viewer scripts did not finish loading. Is vendor/ present?';
+      document.getElementById('error').style.display = 'grid';
+      document.getElementById('stats').textContent = 'load failed';
+    }
+  }, 10000);
+}
+</script>
 <script type="importmap">
 { "imports": { "three": "./vendor/three.module.js",
                "three/addons/": "./vendor/jsm/" } }
@@ -173,10 +206,20 @@ function buildObjectList(meta) {
     const row = document.createElement('div');
     row.className = 'obj';
     const [w, h, d] = obj.size;
-    row.innerHTML =
-      `<span class="swatch" style="background: rgb(${obj.color.join(',')})"></span>` +
-      `<span class="name">${obj.label.split(';')[0]}</span>` +
-      `<span class="size">${w.toFixed(2)}x${h.toFixed(2)}x${d.toFixed(2)}m</span>`;
+    // Labels come from scene.json, which comes from a user-supplied labels.json
+    // or a checkpoint's id2label -- untrusted text.  Build the row with
+    // textContent so a label can never inject markup or script.
+    const swatch = document.createElement('span');
+    swatch.className = 'swatch';
+    const [cr, cg, cb] = obj.color.map((v) => Math.max(0, Math.min(255, v | 0)));
+    swatch.style.background = `rgb(${cr},${cg},${cb})`;
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = String(obj.label).split(';')[0];
+    const size = document.createElement('span');
+    size.className = 'size';
+    size.textContent = `${w.toFixed(2)}x${h.toFixed(2)}x${d.toFixed(2)}m`;
+    row.replaceChildren(swatch, name, size);
     row.title = `${obj.point_count} points, seen in ${obj.observations} frame(s)`;
     row.addEventListener('click', () => {
       const node = byInstance.get(obj.instance_id);
@@ -194,13 +237,19 @@ function setVisible(bucket, visible) {
 // --- click an object in the 3D view to frame it ---------------------------
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-let dragged = false;
-renderer.domElement.addEventListener('pointerdown', () => { dragged = false; });
-renderer.domElement.addEventListener('pointermove', (e) => {
-  if (e.buttons) dragged = true;
+let pressAt = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  pressAt = { x: e.clientX, y: e.clientY };
 });
+// Compare against a distance, not a boolean: a real mouse jitters a pixel or
+// two between press and release, and treating that as a drag cancels the pick.
+const DRAG_SLOP = 5;
+function movedTooFar(e) {
+  if (!pressAt) return true;
+  return Math.hypot(e.clientX - pressAt.x, e.clientY - pressAt.y) > DRAG_SLOP;
+}
 renderer.domElement.addEventListener('pointerup', (event) => {
-  if (dragged || event.button !== 0) return;  // orbiting, not picking
+  if (event.button !== 0 || movedTooFar(event)) return;  // orbiting, not picking
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
@@ -234,7 +283,8 @@ function setColourByLabel(enabled) {
     if (enabled) {
       node.material.vertexColors = false;
       node.material.color.setRGB(
-        obj.color[0] / 255, obj.color[1] / 255, obj.color[2] / 255);
+        obj.color[0] / 255, obj.color[1] / 255, obj.color[2] / 255,
+        THREE.SRGBColorSpace);
     } else {
       node.material.vertexColors = true;
       node.material.color.setRGB(1, 1, 1);
@@ -296,13 +346,6 @@ function fail(message) {
 }
 
 async function main() {
-  if (location.protocol === 'file:') {
-    // ES-module imports are blocked by CORS on file:// before any of our code
-    // runs, so this has to be checked up front rather than caught below.
-    fail('Opened from the filesystem. Browsers block local module loading, ' +
-         'so this page must be served over HTTP.');
-    return;
-  }
   const meta = await fetch('scene.json').then((r) => {
     if (!r.ok) throw new Error('scene.json: HTTP ' + r.status);
     return r.json();
@@ -321,6 +364,12 @@ async function main() {
       // GLTFLoader hands the same cached default material to every mesh that
       // declares none, so styling one surface would restyle every box too.
       node.material = node.material.clone();
+      // Meshes carry vertex colours but no glTF material, so GLTFLoader
+      // substitutes its default -- which is metalness 1.  A fully rough metal
+      // with no environment map has no diffuse term, so every surface and box
+      // renders near-black regardless of its colour.
+      if ('metalness' in node.material) node.material.metalness = 0.0;
+      if ('roughness' in node.material) node.material.roughness = 0.9;
       if (name.startsWith('surface__')) {
         node.material.side = THREE.DoubleSide;
         node.material.transparent = true;
@@ -346,6 +395,23 @@ async function main() {
 
   // A handle for scripting and for automated checks: everything the page
   // builds, reachable from the console.
+  // COLOR_0 is written as sRGB bytes but glTF declares it linear, so three.js
+  // would render the whole cloud washed out.  Convert once, at load.
+  const seenColorAttributes = new Set();
+  gltf.scene.traverse((node) => {
+    const attribute = node.geometry && node.geometry.attributes.color;
+    if (!attribute || seenColorAttributes.has(attribute)) return;
+    seenColorAttributes.add(attribute);
+    const colour = new THREE.Color();
+    for (let i = 0; i < attribute.count; i++) {
+      colour.setRGB(
+        attribute.getX(i), attribute.getY(i), attribute.getZ(i),
+        THREE.SRGBColorSpace);
+      attribute.setXYZ(i, colour.r, colour.g, colour.b);
+    }
+    attribute.needsUpdate = true;
+  });
+
   // Bounding boxes are computed once: the scene is static, and recomputing
   // them per click would walk every point on every pick.
   for (const node of layers.objects) {
