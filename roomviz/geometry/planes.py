@@ -195,6 +195,13 @@ def extract_surfaces(
     heights = points @ up
     height_range = (float(heights.min()), float(heights.max()))
 
+    # Which side of a wall is "inside" is not a property of the wall - it is a
+    # property of where everything else is.  The centroid of the whole
+    # structural cloud stands in for that, computed once over all points
+    # rather than per iteration so a wall's orientation cannot depend on which
+    # planes happened to be extracted before it.
+    interior = points.mean(axis=0)
+
     remaining = np.arange(n)
     surfaces: list[PlaneSurface] = []
 
@@ -211,7 +218,19 @@ def extract_surfaces(
 
         # Orient every normal consistently: walls point towards the interior
         # (the side the bulk of the scene is on), horizontals point up.
-        if float(normal @ up) < 0 and abs(float(normal @ up)) >= HORIZONTAL_COS:
+        #
+        # The wall half of that used to be dead.  Both branches were one test
+        # guarded by `abs(normal @ up) >= HORIZONTAL_COS`, which is true only
+        # for *horizontal* planes, so a wall kept whatever sign the SVD
+        # happened to produce - three of the four walls of a closed room
+        # pointed out of it.  The two cases need different questions, because a
+        # wall has no "up" to agree with: it is the scene that says which side
+        # is inside.
+        alignment = float(normal @ up)
+        if abs(alignment) >= HORIZONTAL_COS:
+            if alignment < 0:
+                normal, offset = -normal, -offset
+        elif float(normal @ interior + offset) < 0:
             normal, offset = -normal, -offset
 
         centroid_height = float(inlier_points.mean(axis=0) @ up)

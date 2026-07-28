@@ -452,23 +452,17 @@ def test_horizontal_plane_normals_are_oriented_upwards():
         assert float(surface.normal[1]) > 0.99, (surface.kind, surface.normal)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "MEASURED DOC/CODE MISMATCH, not a flake. roomviz/geometry/planes.py:213 "
-        "says 'walls point towards the interior (the side the bulk of the scene "
-        "is on), horizontals point up', but the flip on the line below is "
-        "guarded by `abs(normal @ up) >= HORIZONTAL_COS`, so it only ever fires "
-        "for horizontal planes. Wall normals keep whatever sign the SVD "
-        "produced. Measured on the closed room below: normals (0,0,1)@z=3, "
-        "(0,0,-1)@z=0, (-1,0,0)@x=0 and (-1,0,0)@x=4 -- three of the four point "
-        "out of the room. Measured on the end-to-end synthetic scene: two of "
-        "three walls point in, one points out. Fixing this needs a change in "
-        "roomviz/geometry/planes.py, which this test suite does not own; the "
-        "xfail records the real behaviour so the claim is not silently trusted."
-    ),
-)
 def test_wall_normals_point_into_the_room():
+    """Every wall normal points at the room, not away from it.
+
+    This was a real defect, found by writing the test for a README claim that
+    had none.  Both halves of the orientation step were one condition guarded
+    by `abs(normal @ up) >= HORIZONTAL_COS`, which is true only for horizontal
+    planes, so a wall kept whatever sign the SVD produced: three of the four
+    walls below pointed out of the room, and two of three did on the
+    end-to-end scene.  A wall has no "up" to agree with, so it is the bulk of
+    the scene that decides which side is inside.
+    """
     points, kinds, interior = _closed_room_points()
     surfaces, _ = extract_surfaces(
         points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,

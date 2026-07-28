@@ -362,37 +362,33 @@ def test_resize_never_exceeds_the_cap_and_snaps_to_the_patch_size(height, width,
     assert min(out.shape[:2]) >= 14
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "PRODUCTION BUG, measured. roomviz/media/loader.py:87-92 rounds the "
-        "long side DOWN to a multiple of 14 so the cap is honoured, but rounds "
-        "the short side to NEAREST. On an exactly square image the two sides "
-        "are equal, so the 'short' side is also at the cap and rounds up past "
-        "it: resize_frame(900x900, max_side=512) -> 518x504 and "
-        "resize_frame(1080x1080, max_side=768) -> 770x756. It fires for any "
-        "square input whenever max_side %% 14 > 7 (512 and the default 768 both "
-        "qualify; 700 does not). Two consequences: the documented --max-side "
-        "cap is exceeded by up to 7 px, and a square capture comes out 2.8%% "
-        "non-square. Geometry survives because intrinsics are rescaled per "
-        "axis. Fixing it needs a change in roomviz/media/loader.py, which this "
-        "suite does not own."
-    ),
-)
-@pytest.mark.parametrize("side,cap", [(900, 512), (1080, 768)])
+@pytest.mark.parametrize("side,cap", [(900, 512), (1080, 768), (700, 700), (1920, 768)])
 def test_resize_honours_the_cap_for_square_images_too(side, cap):
+    """A square image is the case that broke the cap.
+
+    The long side rounds *down* to a patch multiple so the cap holds; the
+    short side rounds to nearest, to stay close to the true aspect ratio.  On
+    a square image those are the same side, so rounding to nearest carried it
+    past the cap: 900x900 at 512 gave 518x504 and 1080x1080 at the default 768
+    gave 770x756 - over the documented cap, and 2.8% non-square.  It fired for
+    any square input with ``cap % 14 > 7``, which both 512 and the default 768
+    satisfy and 700 does not, so 700 is here as the case that always worked.
+    """
     out = resize_frame(np.zeros((side, side, 3), np.uint8), cap)
     assert max(out.shape[:2]) <= cap, (side, cap, out.shape[:2])
+    assert out.shape[0] == out.shape[1], f"square input came out {out.shape[:2]}"
+    assert out.shape[0] % 14 == 0
 
 
 def test_a_square_image_is_still_downscaled_to_roughly_the_cap():
-    """What *is* true today, so the bug above cannot regress into something
-    worse without being noticed: the result is still near the cap and still a
-    patch multiple, it is just up to 7 px over."""
+    """Honouring the cap must not be achieved by shrinking far below it.
+
+    Stepping back one patch is the whole correction, so the result sits within
+    14 px of the cap rather than at some arbitrary smaller size.
+    """
     out = resize_frame(np.zeros((900, 900, 3), np.uint8), 512)
-    assert out.shape[:2] == (518, 504)
-    assert max(out.shape[:2]) <= 512 + 14
-    assert out.shape[0] % 14 == 0 and out.shape[1] % 14 == 0
+    assert out.shape[:2] == (504, 504)
+    assert 512 - 14 < max(out.shape[:2]) <= 512
 
 
 def test_resize_is_a_no_op_at_exactly_the_cap():

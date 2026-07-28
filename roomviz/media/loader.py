@@ -84,12 +84,23 @@ def resize_frame(rgb: np.ndarray, max_side: int) -> np.ndarray:
     scale = max_side / float(max(h, w))
     # Round the long side *down* to a patch multiple so the cap is honoured -
     # rounding to nearest could exceed it (1920x1080 at max_side 768 gave 770).
+    # The short side rounds to *nearest*, to stay as close to the true aspect
+    # ratio as a patch multiple allows - but rounding up can carry it past the
+    # cap too.  On an exactly square image the "short" side is also at the cap,
+    # so it always did: 900x900 at max_side 512 came out 518x504, breaking both
+    # the documented cap and the squareness, for any cap with `max_side % 14 >
+    # 7` (768, the default, is one).  Stepping back one patch is exactly the
+    # floor the long side already takes, so a square image stays square.
+    def _short(value: float) -> int:
+        rounded = max(14, int(round(value / 14)) * 14)
+        return max(14, rounded - 14) if rounded > max_side else rounded
+
     if w >= h:
         new_w = max(14, int(w * scale // 14) * 14)
-        new_h = max(14, int(round(h * scale / 14)) * 14)
+        new_h = _short(h * scale)
     else:
         new_h = max(14, int(h * scale // 14) * 14)
-        new_w = max(14, int(round(w * scale / 14)) * 14)
+        new_w = _short(w * scale)
     if (new_w, new_h) == (w, h):
         return rgb
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
