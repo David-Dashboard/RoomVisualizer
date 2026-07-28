@@ -35,18 +35,18 @@ def _require_trimesh():
     return trimesh
 
 
-def _safe_label(label: str) -> str:
+def safe_label(label: str) -> str:
     """First synonym of a class name, reduced to name-safe characters."""
     first = label.split(";")[0].strip() or "object"
     return re.sub(r"[^A-Za-z0-9-]+", "_", first)
 
 
 def object_node_name(inst: ObjectInstance) -> str:
-    return f"object__{inst.instance_id}__{_safe_label(inst.label)}"
+    return f"object__{inst.instance_id}__{safe_label(inst.label)}"
 
 
 def box_node_name(inst: ObjectInstance) -> str:
-    return f"box__{inst.instance_id}__{_safe_label(inst.label)}"
+    return f"box__{inst.instance_id}__{safe_label(inst.label)}"
 
 
 def surface_node_name(surface: PlaneSurface) -> str:
@@ -62,6 +62,12 @@ def _box_mesh(trimesh, lo: np.ndarray, hi: np.ndarray, color: tuple[int, int, in
     """
     size = np.maximum(hi - lo, 1e-3)
     thickness = float(np.clip(size.min() * 0.02, 0.004, 0.02))
+    # Inset the edge centre-lines by half the bar thickness so the drawn box
+    # sits *inside* the reported AABB rather than overshooting it - otherwise
+    # measuring the GLB gives a different answer from `scene.json`.
+    inset = thickness / 2.0
+    lo = lo + inset
+    hi = np.maximum(hi - inset, lo)
     corners = np.array(
         [
             [lo[0], lo[1], lo[2]], [hi[0], lo[1], lo[2]],
@@ -98,9 +104,15 @@ def _box_mesh(trimesh, lo: np.ndarray, hi: np.ndarray, color: tuple[int, int, in
 
 
 def _quad_mesh(trimesh, quad: np.ndarray, color: tuple[int, int, int], alpha: int = 190):
-    """Two triangles spanning a planar quad, double-sided via a duplicate."""
+    """Two triangles spanning a planar quad.
+
+    Single-sided on purpose: the viewer renders surfaces with
+    ``THREE.DoubleSide``, and emitting reversed duplicates as well would draw
+    every quad twice.  Coincident transparent triangles blend twice over
+    (turning 0.75 opacity into ~0.94) and z-fight against each other.
+    """
     vertices = np.asarray(quad, dtype=np.float64)
-    faces = np.array([[0, 1, 2], [0, 2, 3], [2, 1, 0], [3, 2, 0]])
+    faces = np.array([[0, 1, 2], [0, 2, 3]])
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
     mesh.visual.face_colors = np.tile(
         np.array([*color, alpha], np.uint8), (len(mesh.faces), 1)

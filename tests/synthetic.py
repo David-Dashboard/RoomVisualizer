@@ -206,8 +206,10 @@ def labels_for(room: Room) -> dict[int, str]:
     return labels
 
 
-def segmentation_for(ids: np.ndarray, room: Room) -> Segmentation:
-    from roomviz.perception.labels import classify
+def segmentation_for(
+    ids: np.ndarray, room: Room, thing_flags: dict[int, bool] | None = None
+) -> Segmentation:
+    from roomviz.perception.labels import classify, is_thing
 
     labels = labels_for(room)
     segments = []
@@ -217,7 +219,12 @@ def segmentation_for(ids: np.ndarray, room: Room) -> Segmentation:
             continue
         label = labels[sid]
         role, kind = classify(label)
-        segments.append(Segment(segment_id=sid, label=label, role=role, structure_kind=kind))
+        segments.append(
+            Segment(
+                segment_id=sid, label=label, role=role, structure_kind=kind,
+                is_thing=thing_flags.get(sid) if thing_flags else is_thing(label),
+            )
+        )
     return Segmentation(ids=ids.astype(np.int32), segments=segments)
 
 

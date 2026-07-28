@@ -16,7 +16,7 @@ import numpy as np
 
 from ..config import PipelineConfig
 from ..types import Scene
-from .gltf import box_node_name, object_node_name, surface_node_name
+from .gltf import box_node_name, object_node_name, safe_label, surface_node_name
 from .palette import label_color, surface_color
 
 
@@ -67,6 +67,7 @@ def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[st
         entry["color"] = list(label_color(inst.label))
         entry["node"] = object_node_name(inst)
         entry["box_node"] = box_node_name(inst)
+        entry["cloud_file"] = f"objects/{inst.instance_id:03d}_{safe_label(inst.label)}.ply"
         payload["objects"].append(entry)
 
     for surface in scene.surfaces:

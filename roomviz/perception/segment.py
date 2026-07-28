@@ -16,7 +16,7 @@ import numpy as np
 from ..config import PipelineConfig
 from ..types import Frame, Segment, Segmentation
 from .base import register_segmentation, resolve_device
-from .labels import classify
+from .labels import classify, is_thing
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +81,7 @@ class Mask2FormerBackend:
                     role=role,
                     score=float(info.get("score", 1.0)),
                     structure_kind=kind,
+                    is_thing=is_thing(label),
                 )
             )
 

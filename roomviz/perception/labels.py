@@ -102,16 +102,60 @@ def classify(label: str, is_thing: bool | None = None) -> tuple[str, str | None]
     return ROLE_OBJECT, None
 
 
-def is_split_candidate(label: str, is_thing: bool | None) -> bool:
-    """Whether a segment should be split into connected components.
+# Indoor "thing" classes: ones a panoptic model instance-separates, emitting a
+# distinct segment id per object.  A segment carrying one of these names covers
+# exactly one object, so it must never be split geometrically - an object that
+# an occluder cut into two visible patches would otherwise become two objects.
+#
+# This is a curated list of the common indoor classes rather than the full
+# ADE20K thing table.  Anything absent is reported as *unknown* rather than as
+# stuff, and unknown segments fall back to geometric splitting (with rejoining
+# if later views connect the pieces), which is the safer default.
+THING_CLASSES: frozenset[str] = frozenset(
+    {
+        "sofa", "couch", "lounge", "chair", "armchair", "swivel chair", "seat",
+        "bench", "stool", "table", "coffee table", "desk", "bed", "cabinet",
+        "wardrobe", "closet", "press", "chest of drawers", "chest", "dresser",
+        "bookcase", "shelf", "counter", "countertop", "sink", "refrigerator",
+        "icebox", "oven", "stove", "microwave", "dishwasher", "washer",
+        "toilet", "bathtub", "shower", "television", "tv", "crt screen",
+        "screen", "monitor", "computer", "laptop", "keyboard", "mouse",
+        "lamp", "chandelier", "sconce", "light", "fan", "clock", "vase",
+        "pot", "flowerpot", "plaything", "toy", "painting", "picture",
+        "poster", "bulletin board", "mirror", "cushion", "pillow", "blanket",
+        "towel", "basket", "box", "bag", "book", "bottle", "glass", "cup",
+        "plate", "food", "tray", "person", "individual", "someone", "cat",
+        "dog", "bicycle", "car", "fireplace", "radiator", "piano",
+        "sculpture", "statue", "ottoman", "pouf", "footstool", "barrel",
+        "trash can", "ashcan", "dustbin", "fan palm", "stairs",
+    }
+)
 
-    Panoptic "stuff" classes produce one mask per class per image, so three
-    separate paintings arrive as a single segment.  Splitting them into
-    connected components recovers per-object instances.  True "thing" classes
-    are already instance-separated and must not be split, or an object
-    occluded into two visible halves would become two objects.
+
+def is_thing(label: str) -> bool | None:
+    """Whether a class is instance-separated by a panoptic model.
+
+    Returns ``None`` when the class is not in :data:`THING_CLASSES` - meaning
+    "unknown", not "stuff".  Callers must treat unknown conservatively.
     """
-    if is_thing:
+    names = set(synonyms(label))
+    if not names:
+        return None
+    if names & THING_CLASSES:
+        return True
+    return None
+
+
+def is_split_candidate(label: str, thing: bool | None = None) -> bool:
+    """Whether a segment may be split into connected components in 3D.
+
+    Panoptic "stuff" classes produce one mask per class per image, so several
+    separate objects can arrive as a single segment; splitting recovers them.
+    True "thing" classes are already instance-separated and must not be split.
+    """
+    if thing is None:
+        thing = is_thing(label)
+    if thing:
         return False
-    role, _ = classify(label, is_thing)
+    role, _ = classify(label)
     return role == ROLE_OBJECT

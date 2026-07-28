@@ -17,7 +17,7 @@ from synthetic import render_sequence
 from roomviz.config import PipelineConfig
 from roomviz.fusion.odometry import estimate_trajectory
 from roomviz.fusion.scene_fusion import fuse
-from roomviz.types import DepthMap, Observation
+from roomviz.types import DepthMap, Observation, Segment, Segmentation
 
 WIDTH, HEIGHT, HFOV = 320, 240, 95.0
 
@@ -71,10 +71,14 @@ def test_odometry_tracks_the_camera(rendered):
         translation_error = np.linalg.norm(estimated[:3, 3] - relative_truth[:3, 3])
         rotation = estimated[:3, :3].T @ relative_truth[:3, :3]
         angle = np.rad2deg(np.arccos(np.clip((np.trace(rotation) - 1) / 2, -1, 1)))
-        # Frame-to-frame ORB+PnP with no bundle adjustment: allow drift to grow,
-        # but it must stay a small fraction of the distance travelled.
-        assert translation_error < 0.12, f"frame {i} drifted {translation_error:.3f} m"
-        assert angle < 3.0, f"frame {i} rotation error {angle:.2f} deg"
+        # Frame-to-frame ORB+PnP with no bundle adjustment: allow drift to
+        # grow, but it must stay a small fraction of the distance travelled.
+        # Measured worst case is ~5 cm; the bound is deliberately close to it,
+        # because a loose one lets real regressions through - composing the
+        # relative pose on the wrong side, a 5% scale error, or 10% wrong
+        # intrinsics all stay under 12 cm on this trajectory.
+        assert translation_error < 0.08, f"frame {i} drifted {translation_error:.3f} m"
+        assert angle < 1.5, f"frame {i} rotation error {angle:.2f} deg"
     assert total_motion > 1.0  # the trajectory is long enough for this to mean something
 
 
@@ -333,7 +337,8 @@ def test_scene_json_describes_the_room(scene, tmp_path):
     assert payload["up_axis"] == "+Y"
     assert payload["summary"]["object_count"] == 4
     assert set(payload["summary"]["labels"]) == {b.label for b in room.boxes}
-    assert payload["room"]["room_height"] == pytest.approx(room.height, abs=0.1)
+    # Measured error is ~1 cm; a 10 cm tolerance would let a 3% inflation pass.
+    assert payload["room"]["room_height"] == pytest.approx(room.height, abs=0.05)
 
     for entry in payload["objects"]:
         assert len(entry["color"]) == 3
@@ -385,3 +390,170 @@ def test_glb_nodes_are_named_for_the_viewer(scene, tmp_path):
     assert sum(1 for n in names if n.startswith("object__")) == len(reconstructed.objects)
     assert sum(1 for n in names if n.startswith("box__")) == len(reconstructed.objects)
     assert sum(1 for n in names if n.startswith("surface__")) == len(reconstructed.surfaces)
+
+
+# --------------------------------------------------------------------------
+# no over-claiming, no silent under-reporting
+# --------------------------------------------------------------------------
+
+def test_scene_never_claims_more_room_than_exists(scene):
+    """Reported bounds must not exceed the true room.
+
+    Only the width is fully observable from this trajectory: the camera starts
+    near the z=0 wall looking away from it, so the near wall is never seen and
+    the recovered depth is legitimately short.  What must never happen is the
+    reverse - reporting a room *larger* than it is.
+    """
+    reconstructed, room, _ = scene
+    low, high = reconstructed.bounds
+    extent = high - low
+    assert extent[0] <= room.width + 0.25, extent
+    assert extent[1] <= room.height + 0.15, extent
+    assert extent[2] <= room.depth + 0.25, extent
+    # And the observable part must actually be recovered, not collapsed.
+    assert extent[0] > room.width - 0.25, extent
+    assert extent[2] > 2.0, extent
+
+
+def test_objects_are_not_silently_shrunk(scene):
+    """Containment alone is one-sided: a shrunken object would still pass.
+
+    For the three fully-visible objects the reconstruction must *fill* most of
+    the true box, not merely stay inside it.
+    """
+    reconstructed, room, _ = scene
+    rotation, translation = _register_to_room(reconstructed, room)
+    truth = {b.label: b for b in room.boxes}
+
+    for label in ("table", "chair", "sofa"):
+        inst = next(o for o in reconstructed.objects if o.label == label)
+        registered = inst.points @ rotation.T + translation
+        lo = np.maximum(registered.min(axis=0), truth[label].lo)
+        hi = np.minimum(registered.max(axis=0), truth[label].hi)
+        covered = np.prod(np.maximum(hi - lo, 0.0))
+        true_volume = np.prod(truth[label].size)
+        assert covered / true_volume > 0.7, (
+            f"{label} fills only {covered / true_volume:.0%} of its true volume"
+        )
+
+
+def test_default_config_still_reconstructs(rendered):
+    """The shipped defaults must work, not just the tuned test config.
+
+    `build_config` overrides voxel size, the object-point floor and the plane
+    inlier floor; without this the suite would never exercise what a user
+    actually gets from `PipelineConfig()`.
+    """
+    _, intr, _, frames, depths, segs = rendered
+    cfg = PipelineConfig()
+    depth_maps = [DepthMap(depth=d) for d in depths]
+    poses = estimate_trajectory(frames, depth_maps, intr, cfg)
+    result = fuse(
+        [
+            Observation(frame=f, depth=d, segmentation=s, intrinsics=intr, pose=p)
+            for f, d, s, p in zip(frames, depth_maps, segs, poses, strict=True)
+        ],
+        cfg,
+    )
+    assert sorted(o.label for o in result.objects) == ["bookcase", "chair", "sofa", "table"]
+    assert any(s.kind == "floor" for s in result.surfaces)
+
+
+def test_survives_depth_noise(rendered):
+    """1% multiplicative depth noise is mild next to any real depth sensor."""
+    room, intr, _, frames, depths, segs = rendered
+    rng = np.random.default_rng(5)
+    noisy = [
+        DepthMap(depth=(d * (1.0 + rng.normal(0, 0.01, d.shape))).astype(np.float32))
+        for d in depths
+    ]
+    cfg = build_config()
+    poses = estimate_trajectory(frames, noisy, intr, cfg)
+    result = fuse(
+        [
+            Observation(frame=f, depth=d, segmentation=s, intrinsics=intr, pose=p)
+            for f, d, s, p in zip(frames, noisy, segs, poses, strict=True)
+        ],
+        cfg,
+    )
+    assert sorted(o.label for o in result.objects) == ["bookcase", "chair", "sofa", "table"]
+    truth = {b.label: b for b in room.boxes}
+    for inst in result.objects:
+        lo, hi = inst.aabb
+        size = hi - lo
+        for axis in (0, 2):
+            assert abs(size[axis] - truth[inst.label].size[axis]) < 0.25, inst.label
+
+
+def test_survives_a_narrow_field_of_view():
+    """A 60-degree lens - the package default - sees much less of the room.
+
+    Fewer surfaces are recoverable because the ceiling leaves the frame, but
+    every object must still be found and measured.
+    """
+    from synthetic import render_sequence as render_narrow
+
+    room, intr, _, frames, depths, segs = render_narrow(width=320, height=240, hfov=60.0)
+    cfg = build_config()
+    depth_maps = [DepthMap(depth=d) for d in depths]
+    poses = estimate_trajectory(frames, depth_maps, intr, cfg)
+    result = fuse(
+        [
+            Observation(frame=f, depth=d, segmentation=s, intrinsics=intr, pose=p)
+            for f, d, s, p in zip(frames, depth_maps, segs, poses, strict=True)
+        ],
+        cfg,
+    )
+    assert sorted(o.label for o in result.objects) == ["bookcase", "chair", "sofa", "table"]
+    assert any(s.kind == "floor" for s in result.surfaces)
+    truth = {b.label: b for b in room.boxes}
+    for inst in result.objects:
+        lo, hi = inst.aabb
+        assert abs((hi - lo)[0] - truth[inst.label].size[0]) < 0.25, inst.label
+
+
+def test_objects_sharing_one_segment_id_are_separated(rendered):
+    """Panoptic stuff masks hold several objects; all of them must survive.
+
+    Deleting the 3D split entirely used to leave the suite green, because the
+    synthetic room gives every box its own segment id and so never exercises
+    the case the split exists for.
+    """
+    from synthetic import FIRST_OBJECT_ID
+
+    _, intr, _, frames, depths, segs = rendered
+    cfg = build_config()
+
+    merged_segs = []
+    for seg in segs:
+        ids = seg.ids.copy()
+        object_ids = [s.segment_id for s in seg.segments if s.role == "object"]
+        for sid in object_ids:
+            ids[ids == sid] = FIRST_OBJECT_ID
+        segments = [s for s in seg.segments if s.role != "object"]
+        shared = next(s for s in seg.segments if s.role == "object")
+        segments.append(
+            Segment(
+                segment_id=FIRST_OBJECT_ID,
+                label="clutter",
+                role="object",
+                structure_kind=None,
+                is_thing=False,   # stuff: one mask covering several objects
+            )
+        )
+        merged_segs.append(Segmentation(ids=ids, segments=segments))
+        del shared
+
+    poses = estimate_trajectory(frames, [DepthMap(depth=d) for d in depths], intr, cfg)
+    result = fuse(
+        [
+            Observation(frame=f, depth=DepthMap(depth=d), segmentation=s,
+                        intrinsics=intr, pose=p)
+            for f, d, s, p in zip(frames, depths, merged_segs, poses, strict=True)
+        ],
+        cfg,
+    )
+    # All four pieces of furniture arrived in one mask; all four must come out.
+    assert len(result.objects) == 4, [
+        (o.label, o.points.shape[0]) for o in result.objects
+    ]

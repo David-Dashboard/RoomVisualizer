@@ -43,7 +43,7 @@ VIEWER_HTML = """<!doctype html>
   label.row { display: flex; align-items: center; gap: 8px; padding: 3px 0;
     cursor: pointer; user-select: none; }
   label.row input { accent-color: var(--accent); }
-  #objects { flex: 1; overflow-y: auto; padding: 10px 16px 24px; }
+  #objects { flex: 1 1 0; min-height: 0; overflow-y: auto; padding: 10px 16px 24px; }
   .obj { display: flex; align-items: center; gap: 8px; padding: 4px 6px;
     border-radius: 6px; cursor: pointer; }
   .obj:hover { background: #1e2431; }
@@ -58,7 +58,14 @@ VIEWER_HTML = """<!doctype html>
   #error { position: absolute; inset: 0; display: none; place-content: center;
     padding: 40px; text-align: center; color: var(--muted); z-index: 20; }
   #error code { color: var(--accent); }
-  @media (max-width: 720px) { #panel { width: 100%; height: 45%; top: auto; } }
+  @media (max-width: 720px) {
+    /* Scroll the whole panel rather than only the object list: at phone
+       heights the fixed groups leave the list a couple of rows tall, so its
+       own scrollbar is not enough to reach the objects comfortably. */
+    #panel { width: 100%; height: 55%; top: auto; overflow-y: auto; }
+    #objects { flex: none; min-height: auto; overflow: visible; }
+    #hint { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -66,8 +73,8 @@ VIEWER_HTML = """<!doctype html>
 <div id="hint">drag to orbit &middot; scroll to zoom &middot; right-drag to pan &middot; click an object to frame it</div>
 <div id="error">
   <div>
-    <p>Could not load <code>scene.glb</code>.</p>
-    <p>Browsers block local file access for security, so serve this folder over HTTP:</p>
+    <p id="reason">Could not load the scene.</p>
+    <p>Serve this folder over HTTP:</p>
     <p><code>roomviz view .</code> &nbsp;or&nbsp; <code>python -m http.server</code></p>
   </div>
 </div>
@@ -123,6 +130,7 @@ controls.enableDamping = true;
 // Buckets of nodes, filled in as the glTF is walked.
 const layers = { cloud: [], objects: [], boxes: [], walls: [], floor: [] };
 const byInstance = new Map();
+const objectBounds = new Map();   // node -> cached world-space Box3
 let sceneMeta = null;
 
 function bucketFor(name) {
@@ -183,6 +191,41 @@ function setVisible(bucket, visible) {
   for (const node of layers[bucket]) node.visible = visible;
 }
 
+// --- click an object in the 3D view to frame it ---------------------------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+let dragged = false;
+renderer.domElement.addEventListener('pointerdown', () => { dragged = false; });
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (e.buttons) dragged = true;
+});
+renderer.domElement.addEventListener('pointerup', (event) => {
+  if (dragged || event.button !== 0) return;  // orbiting, not picking
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+
+  // Pick against each object's bounding box rather than its points.  A ray
+  // through a point cloud passes *between* the points unless the pick radius
+  // is tuned to the sampling density, which makes clicking feel unreliable;
+  // ray-versus-box always hits and costs nothing for a few dozen objects.
+  const hit = new THREE.Vector3();
+  let best = null;
+  let bestDistance = Infinity;
+  for (const node of layers.objects) {
+    if (!node.visible) continue;
+    const box = objectBounds.get(node);
+    if (!box || !raycaster.ray.intersectBox(box, hit)) continue;
+    const distance = raycaster.ray.origin.distanceTo(hit);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = box;
+    }
+  }
+  if (best) frameBox(best);
+});
+
 function setColourByLabel(enabled) {
   if (!sceneMeta) return;
   for (const obj of sceneMeta.objects) {
@@ -207,21 +250,33 @@ for (const [id, bucket] of [['t-cloud', 'cloud'], ['t-objects', 'objects'],
   input.addEventListener('change', () => setVisible(bucket, input.checked));
 }
 document.getElementById('t-bylabel').addEventListener('change', (e) => {
-  setColourByLabel(e.target.checked);
+  const on = e.target.checked;
+  setColourByLabel(on);
   // The full cloud sits on top of the object points, so leaving it on would
   // speckle the flat class colours with the original photo colours.  Toggle it
   // for the user rather than silently rendering a muddle - and move the
-  // checkbox too, so the state on screen still matches what is drawn.
+  // checkboxes too, so what is on screen matches what is drawn.
   const cloud = document.getElementById('t-cloud');
-  cloud.checked = !e.target.checked;
+  cloud.checked = !on;
   setVisible('cloud', cloud.checked);
+  if (on) {
+    // Colouring object points is pointless if they are hidden, and turning the
+    // cloud off while everything else is off would leave a blank stage.
+    const objects = document.getElementById('t-objects');
+    objects.checked = true;
+    setVisible('objects', true);
+  }
 });
 document.getElementById('point-size').addEventListener('input', (e) =>
   applyPointSize(parseFloat(e.target.value)));
 
 function resize() {
   const width = stage.clientWidth, height = stage.clientHeight;
-  renderer.setSize(width, height, false);
+  // Note: no `false` third argument -- three.js must set the canvas CSS
+  // size as well as its backing store, or on a HiDPI display the canvas
+  // ends up devicePixelRatio times too large in CSS pixels and the scene
+  // renders off-screen.
+  renderer.setSize(width, height);
   camera.aspect = width / Math.max(height, 1);
   camera.updateProjectionMatrix();
 }
@@ -233,8 +288,25 @@ function animate() {
   renderer.render(scene, camera);
 }
 
+function fail(message) {
+  const pane = document.getElementById('error');
+  pane.querySelector('#reason').textContent = message;
+  pane.style.display = 'grid';
+  document.getElementById('stats').textContent = 'load failed';
+}
+
 async function main() {
-  const meta = await fetch('scene.json').then((r) => r.json());
+  if (location.protocol === 'file:') {
+    // ES-module imports are blocked by CORS on file:// before any of our code
+    // runs, so this has to be checked up front rather than caught below.
+    fail('Opened from the filesystem. Browsers block local module loading, ' +
+         'so this page must be served over HTTP.');
+    return;
+  }
+  const meta = await fetch('scene.json').then((r) => {
+    if (!r.ok) throw new Error('scene.json: HTTP ' + r.status);
+    return r.json();
+  });
   sceneMeta = meta;
   const gltf = await new GLTFLoader().loadAsync('scene.glb');
 
@@ -245,11 +317,16 @@ async function main() {
     const bucket = bucketFor(name);
     if (bucket) layers[bucket].push(node);
 
-    if (node.isMesh && name.startsWith('surface__')) {
-      node.material.side = THREE.DoubleSide;
-      node.material.transparent = true;
-      node.material.opacity = 0.75;
-      node.material.depthWrite = false;
+    if (node.isMesh) {
+      // GLTFLoader hands the same cached default material to every mesh that
+      // declares none, so styling one surface would restyle every box too.
+      node.material = node.material.clone();
+      if (name.startsWith('surface__')) {
+        node.material.side = THREE.DoubleSide;
+        node.material.transparent = true;
+        node.material.opacity = 0.75;
+        node.material.depthWrite = false;
+      }
     }
     const match = /^object__(\\d+)__/.exec(name);
     if (match && node.isPoints) byInstance.set(parseInt(match[1], 10), node);
@@ -267,6 +344,18 @@ async function main() {
     `${meta.summary.point_count.toLocaleString()} points | ` +
     `${extent.map((v) => v.toFixed(1)).join(' x ')} m`;
 
+  // A handle for scripting and for automated checks: everything the page
+  // builds, reachable from the console.
+  // Bounding boxes are computed once: the scene is static, and recomputing
+  // them per click would walk every point on every pick.
+  for (const node of layers.objects) {
+    objectBounds.set(node, new THREE.Box3().setFromObject(node));
+  }
+
+  window.roomviz = {
+    THREE, scene, camera, controls, layers, byInstance, objectBounds, meta, frameBox,
+  };
+
   resize();
   frameBox(new THREE.Box3().setFromObject(gltf.scene));
   animate();
@@ -274,8 +363,7 @@ async function main() {
 
 main().catch((err) => {
   console.error(err);
-  document.getElementById('error').style.display = 'grid';
-  document.getElementById('stats').textContent = 'load failed';
+  fail(String(err && err.message ? err.message : err));
 });
 </script>
 </body>

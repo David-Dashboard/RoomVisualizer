@@ -119,10 +119,14 @@ model, so depth comes out in metres. That is what makes the camera odometry,
 the fused geometry and the reported object dimensions all consistent with one
 another. Relative checkpoints work too, but their absolute scale is a guess.
 
-**Objects are split in 3D, not in 2D.** Panoptic "stuff" classes return one
-mask per class, so three paintings arrive as a single segment. Splitting them
-in 3D — where genuinely separate objects are separated in space — handles that
-without also splitting an object that an occluder cut in two on screen.
+**The segmenter's instance decision is authoritative; the 3D split is not.**
+Panoptic "stuff" classes return one mask per class, so several objects can
+arrive as a single segment — those get split apart in 3D. A "thing" mask
+already covers exactly one object and is never split, so an object an occluder
+cut in two on screen stays one object. Where two clusters came from one mask,
+they may be rejoined later if another view connects them; where they came from
+different masks in the same frame, they are never merged, however close
+together they sit.
 
 **Occlusion edges are discarded.** Back-projecting across a depth
 discontinuity smears "flying pixels" through empty space between foreground
@@ -130,7 +134,8 @@ and background. Pixels sitting on a large local depth jump are dropped.
 
 **The pipeline under-reports rather than invents.** If the base of a bookcase
 is hidden behind a table in every frame, its reported height is the part that
-was actually seen.
+was actually seen. The same goes for the room: the near wall behind the camera
+is simply absent rather than guessed at.
 
 ---
 
@@ -208,6 +213,13 @@ roomviz reconstruct scan.mp4 -o output \
 `--seg-backend file --seg-dir masks/`, where `masks/` holds integer segment-id
 maps plus a `labels.json` of `{"1": "wall", "2": "floor", "3": "chair"}`.
 
+If one mask covers several objects — the panoptic "stuff" case — say so, and
+they will be separated in 3D rather than fused into one:
+
+```json
+{"1": "wall", "2": {"label": "books", "thing": false}}
+```
+
 Depth and segmentation are independent, so you can mix a real depth sensor
 with the neural segmenter, or vice versa.
 
@@ -231,6 +243,9 @@ with the neural segmenter, or vice versa.
 
 * Frame-to-frame odometry has no loop closure or bundle adjustment, so drift
   accumulates over long trajectories. Keep clips short, or supply poses.
+* Two objects of the same class that are never visible in the same frame and
+  end up within `--object-split-gap` of each other can be merged into one.
+  Co-visibility in any single frame prevents this.
 * Object labels come from the segmentation model's vocabulary (ADE20K by
   default). Anything outside it is labelled as the nearest class it knows.
 * Walls are fitted as planes, so curved or heavily cluttered walls come out as
@@ -244,7 +259,7 @@ with the neural segmenter, or vice versa.
 
 ```bash
 pip install -e ".[dev]"
-pytest          # 91 tests
+pytest          # 123 tests
 ruff check .
 ```
 
@@ -252,8 +267,17 @@ The test suite ray-traces a synthetic room with known dimensions, then runs
 the real pipeline over it with ground-truth depth and masks in place of the
 neural backends. That covers back-projection, odometry, clustering,
 cross-frame association, gravity alignment, plane fitting and export, and
-every assertion is checked against the room's actual measurements — object
-sizes land within a few centimetres.
+every assertion is checked against the room's actual measurements.
+
+**What the numbers mean.** On that scene, horizontal object extents come back
+within 1–3 cm and the room height within about 1 cm. Those are measurements of
+one favourable configuration — perfect depth, perfect masks, a well-lit
+textured room and a smooth camera path — not a guarantee for your footage. The
+suite is built to constrain them rather than merely display them: it includes
+a 1%-depth-noise run, a narrow-field-of-view run, a run on the shipped
+defaults, adversarial cases (objects sharing one mask, a row of near-identical
+objects, an object occluded mid-span), and two-sided assertions so that
+shrinking every object would fail just as loudly as inflating one.
 
 ```
 roomviz/

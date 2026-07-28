@@ -16,9 +16,15 @@ log = logging.getLogger(__name__)
 def intrinsics_from_exif(path: str | Path, width: int, height: int) -> CameraIntrinsics | None:
     """Recover intrinsics from EXIF focal-length metadata, if present.
 
-    Uses ``FocalLengthIn35mmFilm``, which already accounts for sensor crop:
-    a 35mm-equivalent focal length ``f35`` corresponds to
-    ``fx = width * f35 / 36`` since a full frame is 36mm wide.
+    Uses ``FocalLengthIn35mmFilm``, which already accounts for sensor crop.
+    A 35mm frame is 36 x 24 mm, and the 36 mm side maps to the image's **long**
+    side regardless of how the camera was held - so the focal length in pixels
+    is ``max(width, height) * f35 / 36``.
+
+    Dividing the width by 36 unconditionally would make the same camera and
+    lens report different focal lengths in landscape and portrait, which is
+    physically impossible for square pixels: an upright phone photo would come
+    out roughly a third too wide in every reconstructed dimension.
     """
     try:
         from PIL import ExifTags, Image
@@ -38,10 +44,20 @@ def intrinsics_from_exif(path: str | Path, width: int, height: int) -> CameraInt
     if not f35:
         return None
 
-    f_px = width * float(f35) / 36.0
-    log.info("intrinsics from EXIF: 35mm-equivalent f=%smm -> fx=%.1fpx", f35, f_px)
+    # The 36 mm reference side is the long side of the frame, whichever way up
+    # the camera was held.
+    f_px = max(width, height) * float(f35) / 36.0
+    log.info(
+        "intrinsics from EXIF: 35mm-equivalent f=%smm at %dx%d -> f=%.1fpx",
+        f35, width, height, f_px,
+    )
     return CameraIntrinsics(
-        width=width, height=height, fx=f_px, fy=f_px, cx=width / 2.0, cy=height / 2.0
+        width=width,
+        height=height,
+        fx=f_px,
+        fy=f_px,
+        cx=(width - 1) / 2.0,
+        cy=(height - 1) / 2.0,
     )
 
 

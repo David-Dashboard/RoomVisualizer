@@ -23,7 +23,7 @@ import numpy as np
 from ..config import PipelineConfig
 from ..types import DepthMap, Frame, Segment, Segmentation
 from .base import register_depth, register_segmentation
-from .labels import classify
+from .labels import classify, is_thing
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ class FileSegmentationBackend:
         if not self.dir.is_dir():
             raise NotADirectoryError(self.dir)
         labels_path = self.dir / "labels.json"
-        self.labels: dict[int, str] = {}
+        self.labels: dict[int, object] = {}
         if labels_path.exists():
             self.labels = {int(k): v for k, v in json.loads(labels_path.read_text()).items()}
         else:
@@ -154,16 +154,29 @@ class MemoryDepthBackend:
         return DepthMap(depth=depth, metric=True)
 
 
-def _segmentation_from_ids(ids: np.ndarray, labels: dict[int, str]) -> Segmentation:
+def _segmentation_from_ids(ids: np.ndarray, labels: dict[int, object]) -> Segmentation:
     segments: list[Segment] = []
     for sid in np.unique(ids):
         sid = int(sid)
         if sid < 0:
             continue
-        label = labels.get(sid, f"segment_{sid}")
+        entry = labels.get(sid, f"segment_{sid}")
+        # A labels.json value may be a plain name, or an object carrying the
+        # thing/stuff flag: {"3": {"label": "sofa", "thing": true}}.
+        if isinstance(entry, dict):
+            label = str(entry.get("label", f"segment_{sid}"))
+            thing = entry.get("thing")
+        else:
+            label, thing = str(entry), None
         role, kind = classify(label)
         segments.append(
-            Segment(segment_id=sid, label=label, role=role, structure_kind=kind)
+            Segment(
+                segment_id=sid,
+                label=label,
+                role=role,
+                structure_kind=kind,
+                is_thing=thing if thing is not None else is_thing(label),
+            )
         )
     return Segmentation(ids=ids.astype(np.int32), segments=segments)
 

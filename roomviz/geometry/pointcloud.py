@@ -115,23 +115,29 @@ def cluster_connected(points: np.ndarray, voxel: float) -> np.ndarray:
 
 
 def largest_clusters(
-    points: np.ndarray, voxel: float, min_fraction: float = 0.1
+    points: np.ndarray, voxel: float, min_points: int = 1
 ) -> list[np.ndarray]:
     """Split points into connected clusters, keeping the substantial ones.
 
-    Returns a list of index arrays.  Clusters holding less than
-    ``min_fraction`` of the points are dropped as noise; if that would discard
-    everything, the single largest cluster is returned.
+    Returns a list of index arrays, largest first.  Clusters holding fewer than
+    ``min_points`` points are dropped as noise.
+
+    The threshold is deliberately **absolute, not a fraction of the input**.  A
+    relative threshold scales with how many objects share the segment: thirteen
+    equally sized objects in one mask each hold 7.7% of it, so an 8% cutoff
+    discards every one of them and the fallback keeps only a single cluster -
+    silently turning thirteen objects into one.
     """
     labels = cluster_connected(points, voxel)
     if labels.size == 0:
         return []
     counts = np.bincount(labels)
-    threshold = max(1, int(min_fraction * points.shape[0]))
-    keep = [np.flatnonzero(labels == i) for i in np.argsort(-counts) if counts[i] >= threshold]
-    if not keep:
-        keep = [np.flatnonzero(labels == int(np.argmax(counts)))]
-    return keep
+    order = np.argsort(-counts)
+    return [
+        np.flatnonzero(labels == i)
+        for i in order
+        if counts[i] >= max(1, min_points)
+    ]
 
 
 def median_spacing(points: np.ndarray, sample: int = 2000, seed: int = 0) -> float:
@@ -175,24 +181,34 @@ def voxel_iou(a: np.ndarray, b: np.ndarray, voxel: float) -> float:
     return inter / float(len(ka | kb))
 
 
-def oriented_bbox_2d(xy: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """Minimum-area-ish 2D oriented box via PCA.
+def voxel_overlap(a: np.ndarray, b: np.ndarray, voxel: float) -> float:
+    """Intersection over the *smaller* of two point sets, on occupied voxels.
 
-    Returns ``(corners, center, angle)`` with corners ordered counter-clockwise.
+    This is the right measure for matching a single new view against a model
+    accumulated from many views.  Plain IoU puts the growing union in the
+    denominator, so the score decays as the model grows no matter how well the
+    view fits: sweeping along a 5.5 m object drives IoU from 0.46 on the first
+    view to 0.19 by the eighth, and the object splits in two purely because of
+    how much had been seen already.  Intersection-over-minimum asks the
+    question that actually matters - is this view contained in what we have?
     """
-    center = xy.mean(axis=0)
-    centred = xy - center
-    if centred.shape[0] < 3:
-        axes = np.eye(2)
-    else:
-        cov = np.cov(centred.T)
-        _, axes = np.linalg.eigh(cov)
-        axes = axes[:, ::-1].T  # rows = principal axes, major first
-    local = centred @ axes.T
-    lo, hi = local.min(axis=0), local.max(axis=0)
-    corners_local = np.array(
-        [[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]]
-    )
-    corners = corners_local @ axes + center
-    angle = float(np.arctan2(axes[0, 1], axes[0, 0]))
-    return corners, center, angle
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return 0.0
+    ka = {tuple(k) for k in voxel_keys(a, voxel).tolist()}
+    kb = {tuple(k) for k in voxel_keys(b, voxel).tolist()}
+    inter = len(ka & kb)
+    if inter == 0:
+        return 0.0
+    return inter / float(min(len(ka), len(kb)))
+
+
+def sets_are_connected(a: np.ndarray, b: np.ndarray, gap: float, sample: int = 4000) -> bool:
+    """Whether any point of ``a`` lies within ``gap`` of any point of ``b``."""
+    if a.shape[0] == 0 or b.shape[0] == 0:
+        return False
+
+    from scipy.spatial import cKDTree
+
+    rng = np.random.default_rng(0)
+    probe = b if b.shape[0] <= sample else b[rng.choice(b.shape[0], sample, replace=False)]
+    return bool(cKDTree(a).query(probe, k=1, workers=-1)[0].min() <= gap)

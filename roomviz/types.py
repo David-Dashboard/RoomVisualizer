@@ -40,19 +40,32 @@ class CameraIntrinsics:
     def from_hfov(
         cls, width: int, height: int, hfov_deg: float = 60.0
     ) -> CameraIntrinsics:
-        """Build intrinsics from an assumed horizontal field of view."""
+        """Build intrinsics from an assumed horizontal field of view.
+
+        Pixel *centres* sit at integer coordinates ``0 .. width - 1`` (this is
+        the convention :func:`roomviz.geometry.camera.pixel_rays` samples), so
+        the optical centre of the image is at ``(width - 1) / 2``.  The focal
+        length still divides the full ``width`` of image extent, which spans
+        ``-0.5 .. width - 0.5`` under the same convention.
+        """
         f = (width / 2.0) / np.tan(np.deg2rad(hfov_deg) / 2.0)
         return cls(
             width=width,
             height=height,
             fx=float(f),
             fy=float(f),
-            cx=width / 2.0,
-            cy=height / 2.0,
+            cx=(width - 1) / 2.0,
+            cy=(height - 1) / 2.0,
         )
 
     def scaled_to(self, width: int, height: int) -> CameraIntrinsics:
-        """Return intrinsics for the same camera at a different resolution."""
+        """Return intrinsics for the same camera at a different resolution.
+
+        The principal point maps through pixel *edges* rather than centres -
+        ``(c + 0.5) * s - 0.5`` - because a resize preserves the image
+        rectangle, not the integer grid.  Scaling ``c`` directly would drift
+        the optical centre by half a pixel per resize.
+        """
         sx = width / self.width
         sy = height / self.height
         return CameraIntrinsics(
@@ -60,8 +73,8 @@ class CameraIntrinsics:
             height=height,
             fx=self.fx * sx,
             fy=self.fy * sy,
-            cx=self.cx * sx,
-            cy=self.cy * sy,
+            cx=(self.cx + 0.5) * sx - 0.5,
+            cy=(self.cy + 0.5) * sy - 0.5,
         )
 
     @property
@@ -136,6 +149,11 @@ class Segment:
     # Structural sub-type for ROLE_STRUCTURE segments: wall / floor / ceiling.
     structure_kind: str | None = None
 
+    is_thing: bool | None = None
+    """Whether the segmenter instance-separates this class.  ``True`` means the
+    mask covers exactly one object and must not be split geometrically;
+    ``None`` means unknown, which is treated conservatively."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "segment_id": self.segment_id,
@@ -143,6 +161,7 @@ class Segment:
             "role": self.role,
             "score": self.score,
             "structure_kind": self.structure_kind,
+            "is_thing": self.is_thing,
         }
 
 
@@ -182,6 +201,17 @@ class ObjectInstance:
     score: float = 1.0
     observations: int = 1
     frame_indices: list[int] = field(default_factory=list)
+
+    sources: list[tuple[int, int]] = field(default_factory=list)
+    """``(frame_index, segment_id)`` pairs this instance was built from.
+
+    This is the provenance used to decide whether two instances may be merged.
+    The segmenter's per-frame decision is authoritative: two clusters carrying
+    *different* segment ids in the *same* frame are distinct objects and must
+    never be combined, however close together they sit.  Clusters sharing a
+    segment id came from one mask that the 3D split broke apart, so they may be
+    rejoined if later evidence connects them.
+    """
 
     @property
     def centroid(self) -> np.ndarray:

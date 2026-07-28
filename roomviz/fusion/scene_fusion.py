@@ -24,9 +24,11 @@ from ..geometry.pointcloud import (
     adaptive_voxel,
     largest_clusters,
     remove_statistical_outliers,
+    sets_are_connected,
     voxel_downsample,
-    voxel_iou,
+    voxel_overlap,
 )
+from ..perception.labels import is_split_candidate
 from ..types import ROLE_OBJECT, ROLE_STRUCTURE, ObjectInstance, Observation, Scene
 
 log = logging.getLogger(__name__)
@@ -37,6 +39,12 @@ class FrameDetection:
     """One object cluster seen in one frame."""
 
     frame_index: int
+    segment_id: int
+    """Which 2D segment this cluster came from.  Two detections in one frame
+    with different segment ids are distinct objects by the segmenter's own
+    reckoning; two with the same id are pieces of one mask that the 3D split
+    separated."""
+
     label: str
     score: float
     points: np.ndarray
@@ -73,16 +81,20 @@ def _detections_for_frame(
 
     Panoptic "stuff" classes hand back one mask for every instance of a class
     (all the paintings in one mask), so splitting happens in 3D rather than in
-    the image: genuinely separate objects are separated in space, while an
-    object split in two by an occluder is still contiguous in 3D.
+    the image: genuinely separate objects are separated in space.
+
+    A split here is provisional.  An object that occludes itself - a sofa seen
+    along its length - can present as two disconnected patches in one view and
+    as one contiguous patch in the next, so every cluster records the segment
+    it came from and :func:`_merge_instances` may rejoin them later.
     """
     detections: list[FrameDetection] = []
+    floor = max(1, cfg.min_object_points // 2)
     for segment in obs.segmentation.segments:
         if segment.role != ROLE_OBJECT:
             continue
         mask = seg_ids == segment.segment_id
-        count = int(mask.sum())
-        if count < cfg.min_object_points // 2:
+        if int(mask.sum()) < floor:
             continue
 
         seg_points = points[mask]
@@ -90,20 +102,30 @@ def _detections_for_frame(
 
         inliers = remove_statistical_outliers(seg_points)
         seg_points, seg_colors = seg_points[inliers], seg_colors[inliers]
-        if seg_points.shape[0] < cfg.min_object_points // 2:
+        if seg_points.shape[0] < floor:
             continue
 
-        # Split only across gaps wider than a real object separation, and
-        # never narrower than this segment's own sampling density allows.
-        cluster_voxel = adaptive_voxel(seg_points, cfg.object_split_gap)
-        for cluster in largest_clusters(
-            seg_points, voxel=cluster_voxel, min_fraction=0.08
-        ):
-            if cluster.size < cfg.min_object_points // 2:
-                continue
+        # A "thing" mask covers exactly one object by the segmenter's own
+        # reckoning, so it is never split - an object an occluder cut into two
+        # visible patches must stay one object.  Only stuff (or unknown)
+        # classes, which can hold several objects in one mask, are split.
+        if not is_split_candidate(segment.label, segment.is_thing):
+            clusters = [np.arange(seg_points.shape[0])]
+        else:
+            # 26-connectivity links points up to two voxels apart, so a voxel
+            # of `gap / 2` makes the realised split distance `gap`.  Using
+            # `gap` itself splits at roughly twice the documented distance, and
+            # the grid's origin then leaks into the result: whether two objects
+            # separate would depend on where they sit in world coordinates.
+            cluster_voxel = adaptive_voxel(seg_points, cfg.object_split_gap / 2.0)
+            clusters = largest_clusters(
+                seg_points, voxel=cluster_voxel, min_points=floor
+            )
+        for cluster in clusters:
             detections.append(
                 FrameDetection(
                     frame_index=obs.frame.index,
+                    segment_id=segment.segment_id,
                     label=segment.label,
                     score=segment.score,
                     points=seg_points[cluster],
@@ -118,38 +140,40 @@ def _associate(
 ) -> list[ObjectInstance]:
     """Merge per-frame detections into global instances.
 
-    Greedy nearest-match on voxel IoU, restricted to detections that agree on
-    the class label.  Detections from the same frame are never merged: the
-    segmenter already decided they were distinct.
+    Greedy nearest-match on voxel overlap, restricted to detections that agree
+    on the class label.  Two detections in the same frame carrying *different*
+    segment ids are never merged - the segmenter has already ruled they are
+    distinct objects - but two carrying the same id may be, since those were
+    separated by our own 3D split rather than by the segmenter.
 
     Detections are consumed in frame order (largest first within a frame) so
     each instance grows through consecutive views.  Order matters because pose
     error accumulates along the trajectory: neighbouring frames overlap almost
     perfectly, whereas the first and last frames of a sweep may have drifted
-    far enough apart to fall under the IoU threshold and split one object in
-    two.
+    far enough apart to fall below the threshold and split one object in two.
     """
     instances: list[ObjectInstance] = []
     voxel = cfg.voxel_size * 3.0
 
     ordered = sorted(detections, key=lambda d: (d.frame_index, -d.points.shape[0]))
     for det in ordered:
-        best_idx, best_iou = -1, 0.0
+        best_idx, best_score = -1, 0.0
         for i, inst in enumerate(instances):
             if inst.label != det.label:
                 continue
-            if det.frame_index in inst.frame_indices:
+            if _conflicts(inst.sources, [(det.frame_index, det.segment_id)]):
                 continue
-            iou = voxel_iou(det.points, inst.points, voxel)
-            if iou > best_iou:
-                best_idx, best_iou = i, iou
+            score = voxel_overlap(det.points, inst.points, voxel)
+            if score > best_score:
+                best_idx, best_score = i, score
 
-        if best_idx >= 0 and best_iou >= cfg.association_iou:
+        if best_idx >= 0 and best_score >= cfg.association_iou:
             inst = instances[best_idx]
             inst.points = np.vstack([inst.points, det.points])
             inst.colors = np.vstack([inst.colors, det.colors])
             inst.observations += 1
             inst.frame_indices.append(det.frame_index)
+            inst.sources.append((det.frame_index, det.segment_id))
             inst.score = max(inst.score, det.score)
         else:
             instances.append(
@@ -161,24 +185,59 @@ def _associate(
                     score=det.score,
                     observations=1,
                     frame_indices=[det.frame_index],
+                    sources=[(det.frame_index, det.segment_id)],
                 )
             )
 
     return instances
 
 
-def _aabb_iou(a: ObjectInstance, b: ObjectInstance) -> float:
-    """Volumetric IoU of two instances' axis-aligned bounding boxes."""
-    a_lo, a_hi = a.aabb
-    b_lo, b_hi = b.aabb
-    lo = np.maximum(a_lo, b_lo)
-    hi = np.minimum(a_hi, b_hi)
-    overlap = np.prod(np.maximum(hi - lo, 0.0))
-    if overlap <= 0:
+def _conflicts(
+    a_sources: list[tuple[int, int]], b_sources: list[tuple[int, int]]
+) -> bool:
+    """Whether two provenances prove their instances are different objects.
+
+    They do when some frame saw both under *different* segment ids: within a
+    single frame the segmenter assigns one id per object, so two ids means two
+    objects, no matter how close together they ended up in 3D.  This is what
+    keeps a row of identical stools from collapsing into one, and it does not
+    depend on how many frames happened to see each one.
+    """
+    by_frame: dict[int, set[int]] = {}
+    for frame, segment in a_sources:
+        by_frame.setdefault(frame, set()).add(segment)
+    for frame, segment in b_sources:
+        seen = by_frame.get(frame)
+        if seen is not None and seen - {segment}:
+            return True
+    return False
+
+
+def _aabb_iou(a: ObjectInstance, b: ObjectInstance, thickness: float = 1e-3) -> float:
+    """Volumetric IoU of two instances' axis-aligned bounding boxes.
+
+    Extents are floored at ``thickness`` so that a flat object - a painting, a
+    television, a door - still has a comparable volume.  Without it a perfectly
+    planar instance has zero volume, every IoU involving it is zero, and two
+    copies of the same painting can never be recognised as duplicates.
+    """
+    def inflated(box: ObjectInstance) -> tuple[np.ndarray, np.ndarray]:
+        lo, hi = box.aabb
+        centre = (lo + hi) / 2.0
+        extent = np.maximum(hi - lo, thickness)
+        return centre - extent / 2.0, centre + extent / 2.0
+
+    a_lo, a_hi = inflated(a)
+    b_lo, b_hi = inflated(b)
+    overlap = float(
+        np.prod(np.maximum(np.minimum(a_hi, b_hi) - np.maximum(a_lo, b_lo), 0.0))
+    )
+    volume_a = float(np.prod(a_hi - a_lo))
+    volume_b = float(np.prod(b_hi - b_lo))
+    union = volume_a + volume_b - overlap
+    if union <= 0:
         return 0.0
-    volume_a = np.prod(np.maximum(a_hi - a_lo, 1e-6))
-    volume_b = np.prod(np.maximum(b_hi - b_lo, 1e-6))
-    return float(overlap / (volume_a + volume_b - overlap))
+    return max(0.0, overlap / union)
 
 
 def _absorb(target: ObjectInstance, other: ObjectInstance) -> None:
@@ -186,68 +245,68 @@ def _absorb(target: ObjectInstance, other: ObjectInstance) -> None:
     target.colors = np.vstack([target.colors, other.colors])
     target.observations += other.observations
     target.frame_indices.extend(other.frame_indices)
+    target.sources.extend(other.sources)
     target.score = max(target.score, other.score)
 
 
-def _min_distance(a: np.ndarray, b: np.ndarray, sample: int = 4000) -> float:
-    """Smallest distance between two point sets."""
-    from scipy.spatial import cKDTree
-
-    rng = np.random.default_rng(0)
-    if b.shape[0] > sample:
-        b = b[rng.choice(b.shape[0], sample, replace=False)]
-    return float(cKDTree(a).query(b, k=1, workers=-1)[0].min())
-
-
-def _merge_duplicates(
-    instances: list[ObjectInstance],
-    gap: float,
-    iou_threshold: float = 0.5,
-    fragment_ratio: float = 0.4,
+def _merge_instances(
+    instances: list[ObjectInstance], gap: float, iou_threshold: float = 0.5
 ) -> list[ObjectInstance]:
-    """Fold together same-label instances that describe one physical object.
+    """Fold together instances that describe one physical object.
 
-    Two distinct failure modes need cleaning up, and they need different rules:
+    Two failure modes need cleaning up:
 
     * **Drift duplicates** - one object recovered twice because camera drift
       pushed its early and late observations below the association threshold.
-      Both copies are of comparable size and occupy the same volume, so a
-      bounding-box IoU test catches them.  The threshold is deliberately high:
-      two chairs side by side share very little of their bounding volume.
+      Both copies occupy the same volume, so bounding-box IoU catches them.
+    * **Split siblings** - a self-occluding object that presented as two
+      disconnected patches.  These are recognised by touching each other within
+      the same gap that governed the split.
 
-    * **Fragments** - a self-occluding object (a sofa seen along its length)
-      can appear in an early frame as two disconnected surface patches, and the
-      smaller patch may never rejoin the main body.  A fragment is recognised
-      by being much smaller than its neighbour *and* touching it, using the
-      same gap that governed the split in the first place.  Requiring the size
-      asymmetry is what keeps two genuinely adjacent objects apart.
+    Provenance is what makes the second rule safe.  Merging on proximity alone
+    would fuse two chairs standing side by side; merging only when no frame saw
+    the two under different segment ids cannot, because any frame that saw both
+    chairs gave them separate ids.  Sizes are deliberately *not* consulted: the
+    point count of an instance tracks how many frames happened to see it, not
+    how big it is, so a size-ratio rule silently destroys real objects whenever
+    two neighbours differ in visibility.
+
+    Merging is transitive and iterated to a fixed point, so a chain of pieces
+    collapses to one object regardless of the order they are considered in.
     """
-    merged: list[ObjectInstance] = []
-    for inst in sorted(instances, key=lambda i: -i.points.shape[0]):
-        for target in merged:
-            if target.label != inst.label:
+    pool = sorted(instances, key=lambda i: -i.points.shape[0])
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        for i in range(len(pool)):
+            if pool[i] is None:
                 continue
-            same_volume = _aabb_iou(target, inst) >= iou_threshold
-            is_fragment = (
-                inst.points.shape[0] <= fragment_ratio * target.points.shape[0]
-                and _min_distance(target.points, inst.points) <= gap
-            )
-            if same_volume or is_fragment:
-                _absorb(target, inst)
-                break
-        else:
-            merged.append(inst)
+            for j in range(i + 1, len(pool)):
+                if pool[j] is None:
+                    continue
+                a, b = pool[i], pool[j]
+                if a.label != b.label:
+                    continue
+                if _conflicts(a.sources, b.sources):
+                    continue
+                same_volume = _aabb_iou(a, b) >= iou_threshold
+                touching = sets_are_connected(a.points, b.points, gap)
+                if same_volume or touching:
+                    _absorb(a, b)
+                    pool[j] = None
+                    merged_any = True
+        pool = [p for p in pool if p is not None]
 
-    if len(merged) != len(instances):
-        log.info("merged %d duplicate instances", len(instances) - len(merged))
-    return merged
+    if len(pool) != len(instances):
+        log.info("merged %d instance(s) into their parent object", len(instances) - len(pool))
+    return pool
 
 
 def _finalise_instances(
     instances: list[ObjectInstance], cfg: PipelineConfig
 ) -> list[ObjectInstance]:
     """Downsample, drop the wisps, and renumber."""
-    instances = _merge_duplicates(instances, gap=cfg.object_split_gap)
+    instances = _merge_instances(instances, gap=cfg.object_split_gap)
     kept: list[ObjectInstance] = []
     for inst in instances:
         points, colors, _ = voxel_downsample(inst.points, inst.colors, cfg.voxel_size)

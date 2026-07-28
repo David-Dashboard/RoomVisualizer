@@ -8,15 +8,17 @@ import pytest
 from roomviz.geometry.align import (
     alignment_transform,
     apply_transform,
+    estimate_up,
     rotation_between,
 )
-from roomviz.geometry.camera import backproject, depth_edge_mask, project
+from roomviz.geometry.camera import backproject, depth_edge_mask, pixel_rays, project
 from roomviz.geometry.planes import extract_surfaces, fit_plane_lsq, plane_quad, ransac_plane
 from roomviz.geometry.pointcloud import (
     cluster_connected,
     largest_clusters,
     voxel_downsample,
     voxel_iou,
+    voxel_overlap,
 )
 from roomviz.types import CameraIntrinsics, DepthMap
 
@@ -48,11 +50,45 @@ def test_backproject_respects_invalid_depth():
 def test_intrinsics_scaling_preserves_ray_directions():
     intr = CameraIntrinsics.from_hfov(640, 480, 65.0)
     small = intr.scaled_to(320, 240)
-    # A pixel at the same relative position must unproject along the same ray.
-    for u, v in [(0, 0), (640, 480), (100, 350)]:
+    # A point at the same position *in the image rectangle* must unproject
+    # along the same ray.  Pixel centres map through edges: u' = (u+0.5)*s-0.5.
+    for u, v in [(0, 0), (639, 479), (100, 350)]:
         big_ray = ((u - intr.cx) / intr.fx, (v - intr.cy) / intr.fy)
-        small_ray = ((u / 2 - small.cx) / small.fx, (v / 2 - small.cy) / small.fy)
+        us, vs = (u + 0.5) * 0.5 - 0.5, (v + 0.5) * 0.5 - 0.5
+        small_ray = ((us - small.cx) / small.fx, (vs - small.cy) / small.fy)
         assert big_ray == pytest.approx(small_ray, abs=1e-9)
+
+
+def test_principal_point_is_the_image_centre():
+    """The optical axis must land midway between the first and last pixel."""
+    intr = CameraIntrinsics.from_hfov(64, 48, 70.0)
+    rx, ry = pixel_rays(intr)
+    # Rays must be symmetric about the centre, and the centre ray must be zero.
+    assert rx[0, 0] == pytest.approx(-rx[0, -1], abs=1e-12)
+    assert ry[0, 0] == pytest.approx(-ry[-1, 0], abs=1e-12)
+    # The realised field of view spans the full image rectangle.
+    half = np.arctan((intr.width / 2.0) / intr.fx)
+    assert np.rad2deg(2 * half) == pytest.approx(70.0, abs=1e-9)
+
+
+def test_non_square_pixels_are_honoured():
+    """fx and fy must be used independently, not assumed equal.
+
+    Every scene built by `from_hfov` has fx == fy, so a swap of the two is
+    invisible there; a resize that changes the aspect ratio makes them differ.
+    """
+    intr = CameraIntrinsics(width=64, height=48, fx=100.0, fy=50.0, cx=31.5, cy=23.5)
+    depth = DepthMap(depth=np.full((48, 64), 2.0, np.float32))
+    points, idx = backproject(depth, intr)
+    uv, _ = project(points, intr)
+    expected_v, expected_u = np.divmod(idx, 64)
+    assert np.allclose(uv[:, 0], expected_u, atol=1e-6)
+    assert np.allclose(uv[:, 1], expected_v, atol=1e-6)
+    # A point off-centre in x must not have the same offset as one off-centre
+    # in y by the same pixel count -- that is what a swapped fx/fy would give.
+    corner = points[idx == (10 * 64 + 10)][0]
+    assert abs(corner[0]) == pytest.approx(2.0 * 21.5 / 100.0, abs=1e-6)
+    assert abs(corner[1]) == pytest.approx(2.0 * 13.5 / 50.0, abs=1e-6)
 
 
 def test_depth_edge_mask_flags_discontinuities():
@@ -126,6 +162,88 @@ def test_rotation_between_is_a_rotation():
         )
 
 
+def test_rotation_between_survives_the_near_antiparallel_band():
+    """Rodrigues is ill-conditioned just short of 180 degrees.
+
+    This is the level-camera case: the up axis fitted from a floor plane is
+    almost exactly antiparallel to world up.  Getting it wrong here returns a
+    near-identity matrix instead of a flip, and the whole room comes out
+    upside down -- so the entire band is swept, not just the exact endpoint.
+    """
+    up = np.array([0.0, 1.0, 0.0])
+    for tilt_deg in (3.0, 0.5, 0.05, 0.01, 1e-3, 1e-5, 1e-9, 0.0):
+        t = np.deg2rad(tilt_deg)
+        down = np.array([np.sin(t), -np.cos(t), 0.0])
+        rotation = rotation_between(down, up)
+
+        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-6), tilt_deg
+        assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-6, tilt_deg
+        # It must actually flip: the result has to point up, not stay down.
+        assert float((rotation @ down)[1]) > 0.99, tilt_deg
+        assert np.linalg.norm(rotation @ down - up) < 2e-3, tilt_deg
+
+
+def test_rotation_between_fuzz_near_antiparallel():
+    rng = np.random.default_rng(11)
+    worst = 0.0
+    for _ in range(3000):
+        a = rng.normal(size=3)
+        # Concentrate samples in the ill-conditioned region.
+        b = -a + rng.normal(size=3) * 10 ** rng.uniform(-14, -1)
+        rotation = rotation_between(a, b)
+        assert np.abs(rotation @ rotation.T - np.eye(3)).max() < 1e-5
+        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-5)
+        worst = max(
+            worst,
+            np.linalg.norm(
+                rotation @ (a / np.linalg.norm(a)) - b / np.linalg.norm(b)
+            ),
+        )
+    assert worst < 2e-3, f"worst mapping error {worst:.2e}"
+
+
+def test_estimate_up_refuses_rank_deficient_walls():
+    """Two opposite walls do not determine up; the prior must win.
+
+    Parallel wall normals span a line, so the null space is a plane and the
+    smallest singular vector is arbitrary within it -- previously this returned
+    an axis 88 degrees from true up and the floor never got flattened.
+    """
+    rng = np.random.default_rng(12)
+    n = 3000
+    wall_a = np.column_stack(
+        [np.zeros(n), rng.uniform(0, 2.5, n), rng.uniform(-2, 2, n)]
+    )
+    wall_b = np.column_stack(
+        [np.full(n, 4.0), rng.uniform(0, 2.5, n), rng.uniform(-2, 2, n)]
+    )
+    points = np.vstack([wall_a, wall_b]).astype(np.float32)
+    kinds = np.array(["wall"] * (2 * n), dtype=object)
+
+    prior = np.array([0.0, -1.0, 0.0])
+    up = estimate_up(points, kinds, fallback=prior)
+    assert np.allclose(up, prior, atol=1e-9)
+
+
+def test_estimate_up_uses_perpendicular_walls():
+    rng = np.random.default_rng(13)
+    n = 3000
+    wall_a = np.column_stack(
+        [np.zeros(n), rng.uniform(0, 2.5, n), rng.uniform(-2, 2, n)]
+    )
+    wall_b = np.column_stack(
+        [np.full(n, 4.0), rng.uniform(0, 2.5, n), rng.uniform(-2, 2, n)]
+    )
+    wall_c = np.column_stack(
+        [rng.uniform(0, 4, n), rng.uniform(0, 2.5, n), np.full(n, -2.0)]
+    )
+    points = np.vstack([wall_a, wall_b, wall_c]).astype(np.float32)
+    kinds = np.array(["wall"] * (3 * n), dtype=object)
+
+    up = estimate_up(points, kinds, fallback=np.array([0.0, -1.0, 0.0]))
+    assert abs(abs(float(up @ np.array([0.0, 1.0, 0.0]))) - 1.0) < 0.01
+
+
 def test_voxel_downsample_averages_within_cells():
     points = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [5.0, 5.0, 5.0]], np.float32)
     colors = np.array([[0, 0, 0], [100, 100, 100], [255, 255, 255]], np.uint8)
@@ -150,9 +268,31 @@ def test_largest_clusters_drops_noise():
     rng = np.random.default_rng(6)
     main = rng.uniform(0, 0.3, (500, 3))
     speck = np.array([[9.0, 9.0, 9.0]])
-    clusters = largest_clusters(np.vstack([main, speck]).astype(np.float32), 0.05)
+    clusters = largest_clusters(
+        np.vstack([main, speck]).astype(np.float32), 0.05, min_points=10
+    )
     assert len(clusters) == 1
     assert clusters[0].size == 500
+
+
+def test_largest_clusters_keeps_every_object_however_many_there_are():
+    """The noise threshold must be absolute, not a fraction of the input.
+
+    A relative cutoff scales with how many objects share the segment: thirteen
+    equal objects each hold 7.7% of it, so an 8% rule discards all of them and
+    the fallback collapses the lot into one.  That silently deleted twelve real
+    objects, so the count is swept well past the old cliff.
+    """
+    rng = np.random.default_rng(7)
+    for count in (2, 10, 12, 13, 20, 40):
+        blobs = [
+            rng.uniform(0, 0.2, (300, 3)) + np.array([2.0 * i, 0.0, 0.0])
+            for i in range(count)
+        ]
+        points = np.vstack(blobs).astype(np.float32)
+        clusters = largest_clusters(points, voxel=0.05, min_points=50)
+        assert len(clusters) == count, f"{count} objects -> {len(clusters)} clusters"
+        assert all(c.size == 300 for c in clusters)
 
 
 def test_voxel_iou_bounds():
@@ -216,3 +356,72 @@ def test_extract_surfaces_finds_room_shell():
     assert abs(abs(ceiling_surface.offset) - 2.6) < 0.02
     assert ceiling_surface.area == pytest.approx(12.0, rel=0.05)
     assert (assignment >= 0).mean() > 0.95
+
+
+def test_voxel_iou_partial_overlap():
+    """Half-overlapping sets must score strictly between 0 and 1.
+
+    Testing only the identical and disjoint cases is worthless: those two give
+    the same answer under intersection-over-union, intersection-over-minimum
+    and intersection-over-maximum alike, so any of them passes.
+    """
+    grid = np.stack(np.meshgrid(np.arange(10), np.arange(4), np.arange(4), indexing="ij"), -1)
+    grid = grid.reshape(-1, 3).astype(np.float32) * 0.1
+    left = grid[grid[:, 0] < 0.6]        # 6 slabs
+    right = grid[grid[:, 0] >= 0.3]      # 7 slabs, 3 shared
+    iou = voxel_iou(left, right, 0.05)
+    assert 0.2 < iou < 0.4, iou
+    # 3 shared of 10 occupied slabs total.
+    assert iou == pytest.approx(3 / 10, rel=0.15)
+
+
+def test_voxel_overlap_does_not_decay_as_the_model_grows():
+    """Intersection-over-minimum is stable; IoU is not.
+
+    A single view matched against an accumulated model must keep scoring well
+    as the model grows, or a long object splits partway through a sweep.
+    """
+    rng = np.random.default_rng(21)
+    view = rng.uniform([0.0, 0, 0], [1.0, 0.5, 0.5], (8000, 3)).astype(np.float32)
+    scores_iou, scores_overlap = [], []
+    for extent in (1.0, 2.0, 4.0, 8.0):
+        # Point count scales with extent so the model's *density* is constant;
+        # otherwise the model simply gets sparser and that, not the metric,
+        # would be what drives the score down.
+        model = rng.uniform(
+            [0.0, 0, 0], [extent, 0.5, 0.5], (int(8000 * extent), 3)
+        ).astype(np.float32)
+        scores_iou.append(voxel_iou(view, model, 0.05))
+        scores_overlap.append(voxel_overlap(view, model, 0.05))
+
+    assert scores_iou[-1] < 0.4 * scores_iou[0], scores_iou      # IoU collapses
+    assert min(scores_overlap) > 0.9, scores_overlap             # overlap holds
+
+
+def test_merge_similar_folds_a_split_wall():
+    """Sequential RANSAC can cut one wall into parallel slabs; they must rejoin."""
+    rng = np.random.default_rng(22)
+    n = 3000
+    # One physical wall at x = 2, recovered as two offset sheets (what pose
+    # drift does to a wall seen from both ends of a sweep).  The separation is
+    # deliberately wider than the RANSAC threshold -- otherwise a single fit
+    # swallows both sheets and the merge path is never reached -- but inside
+    # the merge tolerance.
+    a = np.column_stack([np.full(n, 2.00) + rng.normal(0, 0.004, n),
+                         rng.uniform(0, 2.5, n), rng.uniform(-2, 0, n)])
+    b = np.column_stack([np.full(n, 2.07) + rng.normal(0, 0.004, n),
+                         rng.uniform(0, 2.5, n), rng.uniform(0, 2, n)])
+    floor = np.column_stack([rng.uniform(0, 2, n), np.zeros(n) + rng.normal(0, 0.004, n),
+                             rng.uniform(-2, 2, n)])
+    points = np.vstack([a, b, floor]).astype(np.float32)
+    kinds = ["wall"] * (2 * n) + ["floor"] * n
+
+    surfaces, _ = extract_surfaces(
+        points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,
+        threshold=0.02, min_inliers=500, max_planes=8,
+    )
+    walls = [s for s in surfaces if s.kind == "wall"]
+    assert len(walls) == 1, [(s.kind, round(s.offset, 3)) for s in surfaces]
+    # The merged wall must span both sheets, not just one.
+    assert walls[0].inlier_count > 1.5 * n
+    assert walls[0].quad[:, 2].max() - walls[0].quad[:, 2].min() > 3.0

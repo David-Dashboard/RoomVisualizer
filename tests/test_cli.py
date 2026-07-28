@@ -104,7 +104,7 @@ def test_reconstruct_end_to_end(capture, tmp_path, capsys):
         if entry["label"] != "bookcase":
             assert abs(entry["size"][1] - box.size[1]) < 0.2, entry["label"]
 
-    assert payload["room"]["room_height"] == pytest.approx(room.height, abs=0.15)
+    assert payload["room"]["room_height"] == pytest.approx(room.height, abs=0.08)
     assert payload["summary"]["surfaces_by_kind"]["floor"] == 1
     assert payload["summary"]["surfaces_by_kind"]["wall"] >= 2
 

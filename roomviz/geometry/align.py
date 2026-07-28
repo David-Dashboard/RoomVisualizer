@@ -22,16 +22,38 @@ WORLD_UP = np.array([0.0, 1.0, 0.0])
 
 
 def rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Shortest-arc rotation matrix taking unit vector ``a`` onto ``b``."""
-    a = a / (np.linalg.norm(a) + 1e-12)
-    b = b / (np.linalg.norm(b) + 1e-12)
-    v = np.cross(a, b)
-    c = float(a @ b)
-    if np.linalg.norm(v) < 1e-9:
-        # Parallel or antiparallel: identity, or a 180-degree flip about any
-        # axis perpendicular to a.
-        if c > 0:
-            return np.eye(3)
+    """Shortest-arc rotation matrix taking unit vector ``a`` onto ``b``.
+
+    Rodrigues' formula carries a ``1 / (1 + c)`` term that blows up as the two
+    vectors approach antiparallel, so the near-180-degree case must be split
+    out explicitly.  The test has to be on ``1 + c`` itself rather than on
+    ``‖a × b‖``: the cross product is still ~1e-8 at a hundredth of a degree
+    from 180, which passes any sane cross-product threshold while ``1 + c`` has
+    already lost most of its significant digits.
+
+    This is the *common* case for a level camera, not a corner case - the up
+    axis estimated from a floor plane is antiparallel to world up whenever the
+    camera is held straight, so getting it wrong turns the whole room upside
+    down.
+    """
+    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
+    if norm_a < 1e-12 or norm_b < 1e-12:
+        return np.eye(3)
+    # Normalise by the true norm.  Adding an epsilon here perturbs the dot
+    # product by more than the true value of `1 + c` in the antiparallel band.
+    a = a / norm_a
+    b = b / norm_b
+
+    c = float(np.clip(a @ b, -1.0, 1.0))
+
+    # Antiparallel (or close enough that Rodrigues is ill-conditioned): rotate
+    # by 180 degrees about any axis perpendicular to `a`.  The threshold trades
+    # two errors against each other - too large and the exact-180 substitution
+    # is a poor approximation, too small and Rodrigues returns a matrix that is
+    # not orthogonal.  Measured worst case over 40k antiparallel-biased samples:
+    # 1e-6 -> 1.4e-3 rad off / 1e-9 non-orthogonality; 1e-8 -> 1.4e-4 / 1e-7;
+    # 1e-12 -> 4.8e-4 / 8.9e-4.  1e-8 minimises the worse of the two.
+    if 1.0 + c < 1e-8:
         helper = np.array([1.0, 0.0, 0.0])
         if abs(float(a @ helper)) > 0.9:
             helper = np.array([0.0, 1.0, 0.0])
@@ -39,6 +61,10 @@ def rotation_between(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         axis /= np.linalg.norm(axis)
         return -np.eye(3) + 2 * np.outer(axis, axis)
 
+    if 1.0 - c < 1e-12:  # already parallel
+        return np.eye(3)
+
+    v = np.cross(a, b)
     kmat = np.array(
         [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
     )
@@ -81,7 +107,24 @@ def estimate_up(
                 # Up is the direction least represented among wall normals.
                 # Weighting rows by sqrt(count) makes the SVD a weighted fit.
                 weighted = normals * np.sqrt(weights)[:, None]
-                _, _, vt = np.linalg.svd(weighted, full_matrices=False)
+                _, singular, vt = np.linalg.svd(weighted, full_matrices=True)
+                # Only trust this if the null space is genuinely 1-D.  When
+                # every visible wall is parallel - a corridor, or a view of two
+                # opposite walls - the normals are rank 1, the null space is
+                # 2-D, and `vt[-1]` is an arbitrary vector within it that can
+                # sit 90 degrees from true up.  Pad to three singular values
+                # (the ambient dimension, which is what the null space lives
+                # in) and require rank >= 2.
+                spectrum = np.zeros(3)
+                spectrum[: singular.shape[0]] = singular
+                if spectrum[1] <= 0.2 * spectrum[0]:
+                    log.info(
+                        "wall normals are rank deficient (singular values %s); "
+                        "cannot infer up from them",
+                        np.round(spectrum, 3),
+                    )
+                    log.info("up axis falling back to camera up: %s", np.round(default, 3))
+                    return default / np.linalg.norm(default)
                 candidate = vt[-1]
                 if float(candidate @ default) < 0:
                     candidate = -candidate

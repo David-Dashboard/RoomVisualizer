@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import PipelineConfig
-from .export.gltf import write_glb
+from .export.gltf import safe_label, write_glb
 from .export.ply import write_ply
 from .export.scene_json import write_scene_json
 from .export.viewer import write_viewer
@@ -20,6 +20,16 @@ from .perception.base import build_depth_backend, build_segmentation_backend
 from .types import Observation, Scene
 
 log = logging.getLogger(__name__)
+
+
+def object_cloud_name(inst) -> str:
+    """Filename for an object's PLY.
+
+    Uses the same sanitiser as the glTF node names so that `scene.json` can
+    reference both, and a checkpoint with unusual class names cannot make the
+    two disagree.
+    """
+    return f"{inst.instance_id:03d}_{safe_label(inst.label)}.ply"
 
 
 @dataclass
@@ -102,16 +112,22 @@ def export_scene(
             output_dir / "scene.ply", scene.points, scene.colors
         )
 
-    if cfg.export_objects and scene.objects:
+    if cfg.export_objects:
         objects_dir = output_dir / "objects"
+        # Clear first: re-running into an existing directory would otherwise
+        # leave the previous scene's clouds behind, and anything globbing
+        # `objects/*.ply` would pick up objects that are no longer in the scene.
+        if objects_dir.exists():
+            for stale in objects_dir.glob("*.ply"):
+                stale.unlink()
         for inst in scene.objects:
-            safe = inst.label.split(";")[0].replace("/", "-").replace(" ", "_")
             files[f"object_{inst.instance_id}"] = write_ply(
-                objects_dir / f"{inst.instance_id:03d}_{safe}.ply",
+                objects_dir / object_cloud_name(inst),
                 inst.points,
                 inst.colors,
             )
-        log.info("wrote %d object clouds to %s", len(scene.objects), objects_dir)
+        if scene.objects:
+            log.info("wrote %d object clouds to %s", len(scene.objects), objects_dir)
 
     if cfg.export_glb:
         files["scene_glb"] = write_glb(output_dir / "scene.glb", scene)

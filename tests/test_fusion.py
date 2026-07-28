@@ -11,9 +11,13 @@ from roomviz.fusion.scene_fusion import (
     FrameDetection,
     _aabb_iou,
     _associate,
-    _merge_duplicates,
+    _conflicts,
+    _merge_instances,
 )
-from roomviz.geometry.pointcloud import adaptive_voxel, median_spacing
+from roomviz.geometry.pointcloud import (
+    adaptive_voxel,
+    median_spacing,
+)
 from roomviz.types import ObjectInstance
 
 
@@ -23,20 +27,29 @@ def block(centre, size=(0.4, 0.4, 0.4), n=600, seed=0):
     return (rng.uniform(-half, half, (n, 3)) + np.array(centre)).astype(np.float32)
 
 
-def detection(frame, label, points, seed=0):
+def detection(frame, label, points, segment_id=None):
     colors = np.full((points.shape[0], 3), 128, np.uint8)
+    # Default: one segment id per label, i.e. the segmenter saw one object.
+    if segment_id is None:
+        segment_id = abs(hash(label)) % 1000
     return FrameDetection(
-        frame_index=frame, label=label, score=1.0, points=points, colors=colors
+        frame_index=frame,
+        segment_id=segment_id,
+        label=label,
+        score=1.0,
+        points=points,
+        colors=colors,
     )
 
 
-def instance(instance_id, label, points):
+def instance(instance_id, label, points, sources=None):
     return ObjectInstance(
         instance_id=instance_id,
         label=label,
         points=points,
         colors=np.full((points.shape[0], 3), 128, np.uint8),
         frame_indices=[0],
+        sources=list(sources) if sources is not None else [(0, instance_id)],
     )
 
 
@@ -57,10 +70,10 @@ def test_same_object_across_frames_becomes_one_instance():
 def test_distant_objects_stay_separate():
     cfg = PipelineConfig()
     detections = [
-        detection(0, "chair", block((0.0, 0.5, 2.0), seed=1)),
-        detection(0, "chair", block((3.0, 0.5, 2.0), seed=2)),
-        detection(1, "chair", block((0.0, 0.5, 2.0), seed=3)),
-        detection(1, "chair", block((3.0, 0.5, 2.0), seed=4)),
+        detection(0, "chair", block((0.0, 0.5, 2.0), seed=1), segment_id=1),
+        detection(0, "chair", block((3.0, 0.5, 2.0), seed=2), segment_id=2),
+        detection(1, "chair", block((0.0, 0.5, 2.0), seed=3), segment_id=1),
+        detection(1, "chair", block((3.0, 0.5, 2.0), seed=4), segment_id=2),
     ]
     instances = _associate(detections, cfg)
     assert len(instances) == 2
@@ -76,12 +89,16 @@ def test_different_labels_never_merge():
     assert len(instances) == 2
 
 
-def test_two_detections_in_one_frame_are_never_merged():
+def test_different_segments_in_one_frame_are_never_merged():
     """The segmenter already decided these are distinct objects."""
     cfg = PipelineConfig(association_iou=0.0)
     points = block((1.0, 0.5, 2.0))
     instances = _associate(
-        [detection(0, "chair", points), detection(0, "chair", points + 0.001)], cfg
+        [
+            detection(0, "chair", points, segment_id=1),
+            detection(0, "chair", points + 0.001, segment_id=2),
+        ],
+        cfg,
     )
     assert len(instances) == 2
 
@@ -98,36 +115,111 @@ def test_aabb_iou_extremes():
 
 
 def test_drift_duplicates_are_merged():
-    a = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1))
-    b = instance(1, "sofa", block((1.05, 0.3, 2.05), size=(1.4, 0.6, 1.2), n=1800, seed=2))
-    merged = _merge_duplicates([a, b], gap=0.12)
+    a = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1),
+                 sources=[(0, 7)])
+    b = instance(1, "sofa", block((1.05, 0.3, 2.05), size=(1.4, 0.6, 1.2), n=1800, seed=2),
+                 sources=[(5, 7)])
+    merged = _merge_instances([a, b], gap=0.12)
     assert len(merged) == 1
     assert merged[0].points.shape[0] == 3800
 
 
-def test_touching_fragment_is_absorbed():
-    """A small patch adjacent to a much larger same-label body is part of it."""
-    body = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1))
-    fragment = instance(
-        1, "sofa", block((1.0, 0.65, 2.0), size=(1.2, 0.06, 1.0), n=200, seed=2)
+def test_touching_split_sibling_is_rejoined():
+    """Two patches of one segment that touch are one object."""
+    body = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1),
+                    sources=[(0, 7)])
+    sibling = instance(
+        1, "sofa", block((1.0, 0.65, 2.0), size=(1.2, 0.06, 1.0), n=200, seed=2),
+        sources=[(0, 7)],
     )
-    merged = _merge_duplicates([body, fragment], gap=0.12)
+    merged = _merge_instances([body, sibling], gap=0.12)
     assert len(merged) == 1
     assert merged[0].points.shape[0] == 2200
 
 
-def test_similar_sized_neighbours_are_not_merged():
+def test_equal_sized_split_siblings_are_rejoined():
+    """A sofa occluded mid-span yields two halves of the *same* size.
+
+    A size-asymmetry rule cannot rejoin these; provenance can, because both
+    halves carry the same segment id.
+    """
+    left = instance(0, "sofa", block((0.5, 0.3, 2.0), size=(1.0, 0.6, 1.0), n=1400, seed=1),
+                    sources=[(0, 7)])
+    right = instance(1, "sofa", block((1.55, 0.3, 2.0), size=(1.0, 0.6, 1.0), n=1400, seed=2),
+                     sources=[(0, 7)])
+    merged = _merge_instances([left, right], gap=0.12)
+    assert len(merged) == 1
+
+
+def test_adjacent_distinct_objects_are_not_merged():
     """Two chairs pushed together must stay two chairs."""
-    a = instance(0, "chair", block((0.0, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=1000, seed=1))
-    b = instance(1, "chair", block((0.55, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=950, seed=2))
-    merged = _merge_duplicates([a, b], gap=0.12)
+    a = instance(0, "chair", block((0.0, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=1000, seed=1),
+                 sources=[(0, 1), (1, 1)])
+    b = instance(1, "chair", block((0.55, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=950, seed=2),
+                 sources=[(0, 2), (1, 2)])
+    merged = _merge_instances([a, b], gap=0.12)
     assert len(merged) == 2
 
 
-def test_distant_fragment_is_not_absorbed():
-    body = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1))
-    far = instance(1, "sofa", block((6.0, 0.3, 2.0), size=(0.3, 0.2, 0.3), n=150, seed=2))
-    assert len(_merge_duplicates([body, far], gap=0.12)) == 2
+def test_visibility_asymmetry_does_not_destroy_a_neighbour():
+    """Point count tracks how many frames saw an object, not how big it is.
+
+    A rule keyed on relative point count merges a rarely-seen chair into its
+    well-seen neighbour; provenance is immune to that.
+    """
+    seen_often = instance(
+        0, "chair", block((0.0, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=5000, seed=1),
+        sources=[(f, 1) for f in range(6)],
+    )
+    seen_once = instance(
+        1, "chair", block((0.58, 0.5, 0.0), size=(0.5, 0.9, 0.5), n=400, seed=2),
+        sources=[(0, 2)],
+    )
+    assert len(_merge_instances([seen_often, seen_once], gap=0.12)) == 2
+
+
+def test_merging_does_not_cascade_along_a_row():
+    """Absorbing must not grow one instance into its distant neighbours."""
+    stools = [
+        instance(
+            i, "stool",
+            block((0.6 * i, 0.4, 0.0), size=(0.5, 0.8, 0.5), n=n, seed=i + 1),
+            sources=[(f, i) for f in range(3)],
+        )
+        for i, n in enumerate([1000, 400, 390, 380, 370])
+    ]
+    merged = _merge_instances(stools, gap=0.12)
+    assert len(merged) == 5
+    widths = [float(m.aabb[1][0] - m.aabb[0][0]) for m in merged]
+    assert max(widths) < 0.6, widths
+
+
+def test_distant_sibling_is_not_absorbed():
+    body = instance(0, "sofa", block((1.0, 0.3, 2.0), size=(1.4, 0.6, 1.2), n=2000, seed=1),
+                    sources=[(0, 7)])
+    far = instance(1, "sofa", block((6.0, 0.3, 2.0), size=(0.3, 0.2, 0.3), n=150, seed=2),
+                   sources=[(0, 7)])
+    assert len(_merge_instances([body, far], gap=0.12)) == 2
+
+
+def test_conflicts_detects_same_frame_different_segments():
+    assert _conflicts([(0, 1)], [(0, 2)]) is True
+    assert _conflicts([(0, 1)], [(0, 1)]) is False
+    assert _conflicts([(0, 1)], [(1, 2)]) is False
+    assert _conflicts([(0, 1), (1, 1)], [(2, 5), (1, 9)]) is True
+
+
+def test_planar_object_duplicates_are_still_comparable():
+    """A painting has zero thickness; IoU must not collapse to zero."""
+    flat = np.column_stack([
+        np.random.default_rng(3).uniform(0, 1.2, 800),
+        np.random.default_rng(4).uniform(0, 0.8, 800),
+        np.zeros(800),
+    ]).astype(np.float32)
+    a = instance(0, "painting", flat, sources=[(0, 3)])
+    b = instance(1, "painting", flat.copy(), sources=[(4, 3)])
+    assert _aabb_iou(a, b) > 0.9
+    assert len(_merge_instances([a, b], gap=0.12)) == 1
 
 
 # --------------------------------------------------------------------------
@@ -172,3 +264,52 @@ def test_invert_rigid_is_a_true_inverse():
         transform[:3, :3] = q
         transform[:3, 3] = rng.normal(size=3)
         assert np.allclose(invert_rigid(transform) @ transform, np.eye(4), atol=1e-10)
+
+
+def test_association_threshold_is_enforced():
+    """Provenance cannot separate objects that were never co-visible.
+
+    Two same-label objects seen in disjoint frame sets carry no conflicting
+    evidence, so nothing but the overlap threshold stops them being fused.
+    """
+    cfg = PipelineConfig(association_iou=0.15)
+    detections = [
+        # One chair in frames 0-1, a different chair 4 m away in frames 2-3.
+        detection(0, "chair", block((0.0, 0.5, 0.0), seed=1), segment_id=1),
+        detection(1, "chair", block((0.0, 0.5, 0.0), seed=2), segment_id=1),
+        detection(2, "chair", block((4.0, 0.5, 0.0), seed=3), segment_id=1),
+        detection(3, "chair", block((4.0, 0.5, 0.0), seed=4), segment_id=1),
+    ]
+    instances = _associate(detections, cfg)
+    assert len(instances) == 2, [
+        (i.frame_indices, i.centroid.round(2).tolist()) for i in instances
+    ]
+
+
+def test_association_threshold_admits_a_genuine_match():
+    """The same threshold must not reject a real overlap."""
+    cfg = PipelineConfig(association_iou=0.15)
+    base = block((1.0, 0.5, 2.0), n=1500)
+    detections = [
+        detection(0, "chair", base, segment_id=1),
+        detection(1, "chair", base + 0.02, segment_id=1),
+    ]
+    assert len(_associate(detections, cfg)) == 1
+
+
+def test_association_order_is_frame_ordered():
+    """Growing an instance through consecutive views is what bounds drift.
+
+    Consuming detections out of frame order lets an instance jump from the
+    first view to the last, where accumulated pose error is largest.
+    """
+    cfg = PipelineConfig(association_iou=0.35)
+    # A steadily drifting object: consecutive views overlap well, the first and
+    # last barely at all.
+    detections = [
+        detection(i, "sofa", block((0.35 * i, 0.5, 2.0), size=(0.8, 0.5, 0.5), n=1200,
+                                   seed=i + 1), segment_id=1)
+        for i in range(6)
+    ]
+    assert len(_associate(detections, cfg)) == 1
+    assert len(_associate(list(reversed(detections)), cfg)) == 1

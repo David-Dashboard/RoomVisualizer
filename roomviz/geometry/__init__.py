@@ -9,11 +9,15 @@ from .camera import (
 )
 from .planes import extract_surfaces, fit_plane_lsq, plane_quad, ransac_plane
 from .pointcloud import (
+    adaptive_voxel,
     cluster_connected,
     largest_clusters,
+    median_spacing,
     remove_statistical_outliers,
+    sets_are_connected,
     voxel_downsample,
     voxel_iou,
+    voxel_overlap,
 )
 
 __all__ = [
@@ -34,6 +38,10 @@ __all__ = [
     "remove_statistical_outliers",
     "resolve_intrinsics",
     "rotation_between",
+    "adaptive_voxel",
+    "median_spacing",
+    "sets_are_connected",
     "voxel_downsample",
     "voxel_iou",
+    "voxel_overlap",
 ]

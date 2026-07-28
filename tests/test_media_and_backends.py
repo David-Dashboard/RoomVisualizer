@@ -274,3 +274,167 @@ def test_missing_sidecar_raises(tmp_path):
     frame = Frame(index=9, rgb=np.zeros((4, 4, 3), np.uint8), source_index=9)
     with pytest.raises(FileNotFoundError):
         build_depth_backend(cfg).predict(frame)
+
+
+# --------------------------------------------------------------------------
+# intrinsics resolution
+# --------------------------------------------------------------------------
+
+def _write_jpeg_with_focal(path, width, height, f35):
+    from PIL import ExifTags, Image
+
+    tag = {v: k for k, v in ExifTags.TAGS.items()}["FocalLengthIn35mmFilm"]
+    image = Image.new("RGB", (width, height), (128, 128, 128))
+    exif = Image.Exif()
+    exif[tag] = int(f35)
+    image.save(path, exif=exif)
+    return path
+
+
+def test_exif_focal_length_is_orientation_independent(tmp_path):
+    """The same camera and lens must give the same focal length either way up.
+
+    A 35mm frame is 36x24mm and the 36mm side is the *long* one, so dividing
+    the width by 36 unconditionally under-reports a portrait photo by the
+    aspect ratio -- roughly a third for a phone, which scales every recovered
+    dimension with it.
+    """
+    from roomviz.geometry.camera import intrinsics_from_exif
+
+    landscape = intrinsics_from_exif(
+        _write_jpeg_with_focal(tmp_path / "l.jpg", 4032, 3024, 26), 4032, 3024
+    )
+    portrait = intrinsics_from_exif(
+        _write_jpeg_with_focal(tmp_path / "p.jpg", 3024, 4032, 26), 3024, 4032
+    )
+    assert landscape is not None and portrait is not None
+    assert landscape.fx == pytest.approx(portrait.fx, rel=1e-9)
+    assert landscape.fx == pytest.approx(4032 * 26 / 36.0, rel=1e-9)
+
+
+def test_exif_absent_returns_none(tmp_path):
+    from PIL import Image
+
+    from roomviz.geometry.camera import intrinsics_from_exif
+
+    path = tmp_path / "bare.jpg"
+    Image.new("RGB", (64, 48)).save(path)
+    assert intrinsics_from_exif(path, 64, 48) is None
+
+
+def test_explicit_intrinsics_win_and_rescale(tmp_path):
+    """`--intrinsics` is given at capture resolution and must be rescaled."""
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    cfg = PipelineConfig(intrinsics=(1000.0, 1000.0, 640.0, 360.0))
+    intr = resolve_intrinsics(cfg, 640, 360, original_size=(1280, 720))
+    assert intr.fx == pytest.approx(500.0)
+    assert intr.fy == pytest.approx(500.0)
+    assert intr.cx == pytest.approx((640.0 + 0.5) * 0.5 - 0.5)
+
+
+def test_explicit_intrinsics_beat_exif(tmp_path):
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    path = _write_jpeg_with_focal(tmp_path / "x.jpg", 800, 600, 28)
+    cfg = PipelineConfig(intrinsics=(123.0, 456.0, 10.0, 20.0))
+    intr = resolve_intrinsics(cfg, 800, 600, source_path=str(path), original_size=(800, 600))
+    assert (intr.fx, intr.fy) == (123.0, 456.0)
+
+
+def test_hfov_fallback_is_used_last():
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    intr = resolve_intrinsics(PipelineConfig(hfov_deg=90.0), 100, 50)
+    assert intr.fx == pytest.approx(50.0 / np.tan(np.pi / 4), rel=1e-9)
+
+
+# --------------------------------------------------------------------------
+# relative-depth conversion (pure numpy, no weights needed)
+# --------------------------------------------------------------------------
+
+def test_relative_depth_maps_disparity_to_a_metric_range():
+    """Relative checkpoints emit disparity: larger means nearer."""
+    from roomviz.perception.depth import _relative_to_metric
+
+    disparity = np.linspace(0.0, 1.0, 200).astype(np.float32).reshape(10, 20)
+    depth = _relative_to_metric(disparity, near=0.5, far=10.0)
+
+    assert depth.shape == disparity.shape
+    # Monotonically decreasing in disparity, and inside the requested range.
+    flat = depth.reshape(-1)
+    assert np.all(np.diff(flat) <= 1e-6)
+    assert flat.min() == pytest.approx(0.5, rel=0.05)
+    assert flat.max() == pytest.approx(10.0, rel=0.05)
+
+
+def test_relative_depth_handles_a_constant_prediction():
+    from roomviz.perception.depth import _relative_to_metric
+
+    out = _relative_to_metric(np.full((8, 8), 3.0, np.float32), near=0.4, far=8.0)
+    assert np.isfinite(out).all()
+    assert out.min() > 0.0
+
+
+def test_relative_depth_is_robust_to_outliers():
+    """Percentile clipping must stop one spike compressing everything else."""
+    from roomviz.perception.depth import _relative_to_metric
+
+    disparity = np.linspace(0.2, 0.8, 400).astype(np.float32)
+    clean = _relative_to_metric(disparity.copy(), near=0.5, far=10.0)
+    spiked = disparity.copy()
+    spiked[0] = 1e6
+    assert np.allclose(clean[5:-5], _relative_to_metric(spiked, 0.5, 10.0)[5:-5], rtol=0.05)
+
+
+# --------------------------------------------------------------------------
+# sidecar lookup fallback
+# --------------------------------------------------------------------------
+
+def test_sidecar_positional_fallback_matches_sorted_order(tmp_path):
+    """Unnumbered sidecars fall back to sorted position; pin that mapping down."""
+    from roomviz.perception.precomputed import _find_for_frame
+
+    directory = tmp_path / "depth"
+    directory.mkdir()
+    for name in ("alpha", "beta", "gamma"):
+        np.save(directory / f"{name}.npy", np.ones((2, 2), np.float32))
+
+    chosen = [_find_for_frame(directory, i, (".npy",)).stem for i in range(3)]
+    assert chosen == ["alpha", "beta", "gamma"]
+    with pytest.raises(FileNotFoundError):
+        _find_for_frame(directory, 3, (".npy",))
+
+
+def test_numbered_sidecars_beat_positional_order(tmp_path):
+    from roomviz.perception.precomputed import _find_for_frame
+
+    directory = tmp_path / "depth"
+    directory.mkdir()
+    for i in (0, 5, 9):
+        np.save(directory / f"{i:06d}.npy", np.full((2, 2), float(i), np.float32))
+    # Frame 5 must resolve to 000005, not to the second file in sorted order.
+    assert _find_for_frame(directory, 5, (".npy",)).stem == "000005"
+    assert _find_for_frame(directory, 9, (".npy",)).stem == "000009"
+
+
+def test_labels_json_may_carry_thing_flags(tmp_path):
+    """A stuff mask holding several objects must be declarable as such."""
+    directory = tmp_path / "seg"
+    directory.mkdir()
+    ids = np.zeros((8, 8), np.int32)
+    ids[:, :4] = 1
+    ids[:, 4:] = 2
+    np.save(directory / "000000.npy", ids)
+    (directory / "labels.json").write_text(
+        json.dumps({"1": "wall", "2": {"label": "clutter", "thing": False}})
+    )
+    cfg = PipelineConfig(seg_backend="file", seg_dir=str(directory))
+    backend = build_segmentation_backend(cfg)
+
+    from roomviz.types import Frame
+
+    seg = backend.predict(Frame(index=0, rgb=np.zeros((8, 8, 3), np.uint8), source_index=0))
+    by_id = seg.by_id()
+    assert by_id[2].label == "clutter"
+    assert by_id[2].is_thing is False
