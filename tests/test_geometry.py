@@ -410,6 +410,80 @@ def test_extract_surfaces_finds_room_shell():
     assert (assignment >= 0).mean() > 0.95
 
 
+def _closed_room_points(seed: int = 9, n: int = 4000):
+    """A complete 4 x 2.6 x 3 m box: floor, ceiling and all four walls."""
+    rng = np.random.default_rng(seed)
+
+    def slab(fixed_axis, value, a_range, b_range):
+        pts = np.zeros((n, 3))
+        axes = [i for i in range(3) if i != fixed_axis]
+        pts[:, fixed_axis] = value + rng.normal(0, 0.004, n)
+        pts[:, axes[0]] = rng.uniform(*a_range, n)
+        pts[:, axes[1]] = rng.uniform(*b_range, n)
+        return pts
+
+    parts = [
+        slab(1, 0.0, (0, 4), (0, 3)),
+        slab(1, 2.6, (0, 4), (0, 3)),
+        slab(0, 0.0, (0, 2.6), (0, 3)),
+        slab(0, 4.0, (0, 2.6), (0, 3)),
+        slab(2, 0.0, (0, 4), (0, 2.6)),
+        slab(2, 3.0, (0, 4), (0, 2.6)),
+    ]
+    kinds = ["floor"] * n + ["ceiling"] * n + ["wall"] * 4 * n
+    return np.vstack(parts).astype(np.float32), kinds, np.array([2.0, 1.3, 1.5])
+
+
+def test_horizontal_plane_normals_are_oriented_upwards():
+    """The half of the orientation rule in `extract_surfaces` that is real.
+
+    Floor and ceiling normals must both point along +up, whichever side of the
+    plane the points were seen from.  This is what makes `classify_plane`'s
+    height comparison and the exported `normal` field mean anything.
+    """
+    points, kinds, _ = _closed_room_points()
+    surfaces, _ = extract_surfaces(
+        points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,
+        threshold=0.02, min_inliers=500, max_planes=10,
+    )
+    horizontals = [s for s in surfaces if s.kind in ("floor", "ceiling")]
+    assert len(horizontals) == 2
+    for surface in horizontals:
+        assert float(surface.normal[1]) > 0.99, (surface.kind, surface.normal)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "MEASURED DOC/CODE MISMATCH, not a flake. roomviz/geometry/planes.py:213 "
+        "says 'walls point towards the interior (the side the bulk of the scene "
+        "is on), horizontals point up', but the flip on the line below is "
+        "guarded by `abs(normal @ up) >= HORIZONTAL_COS`, so it only ever fires "
+        "for horizontal planes. Wall normals keep whatever sign the SVD "
+        "produced. Measured on the closed room below: normals (0,0,1)@z=3, "
+        "(0,0,-1)@z=0, (-1,0,0)@x=0 and (-1,0,0)@x=4 -- three of the four point "
+        "out of the room. Measured on the end-to-end synthetic scene: two of "
+        "three walls point in, one points out. Fixing this needs a change in "
+        "roomviz/geometry/planes.py, which this test suite does not own; the "
+        "xfail records the real behaviour so the claim is not silently trusted."
+    ),
+)
+def test_wall_normals_point_into_the_room():
+    points, kinds, interior = _closed_room_points()
+    surfaces, _ = extract_surfaces(
+        points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,
+        threshold=0.02, min_inliers=500, max_planes=10,
+    )
+    walls = [s for s in surfaces if s.kind == "wall"]
+    assert len(walls) == 4
+    for wall in walls:
+        signed = float(np.asarray(wall.normal, float) @ interior + wall.offset)
+        assert signed > 0, (
+            f"wall with normal {np.round(wall.normal, 3)} at offset "
+            f"{wall.offset:.3f} points away from the room interior"
+        )
+
+
 def test_voxel_iou_partial_overlap():
     """Half-overlapping sets must score strictly between 0 and 1.
 
@@ -505,24 +579,335 @@ def test_classify_plane_labels_break_the_floor_ceiling_tie():
     assert classify_plane(horizontal, 0.0, up, ["ceiling"] * 5, 0.05, span) == "ceiling"
 
 
-def test_ransac_plane_refits_on_its_inliers():
-    """The winning minimal sample is biased; the refit is what removes that.
+PLANE_NOISE_SIGMA = 0.006
 
-    Skipping it leaves the plane defined by three random points, which is
-    still accurate enough to pass loose end-to-end checks -- so the refit is
-    pinned exactly here instead.
-    """
-    rng = np.random.default_rng(31)
+
+def _noisy_plane(seed: int, n_inliers: int = 1500, n_outliers: int = 400):
+    """A z = 2 plane with Gaussian thickness, buried in uniform outliers."""
+    rng = np.random.default_rng(seed)
     inliers = np.column_stack(
-        [rng.uniform(-1, 1, 1500), rng.uniform(-1, 1, 1500), rng.normal(0, 0.006, 1500) + 2.0]
+        [
+            rng.uniform(-1, 1, n_inliers),
+            rng.uniform(-1, 1, n_inliers),
+            rng.normal(0, PLANE_NOISE_SIGMA, n_inliers) + 2.0,
+        ]
     )
-    outliers = rng.uniform(-3, 3, (400, 3))
-    points = np.vstack([inliers, outliers]).astype(np.float32)
+    outliers = rng.uniform(-3, 3, (n_outliers, 3))
+    return np.vstack([inliers, outliers]).astype(np.float32)
 
-    normal, offset, mask = ransac_plane(points, threshold=0.03, rng=rng)
-    # The returned plane must be the least-squares fit of its own inliers.
-    refit_normal, refit_offset = fit_plane_lsq(points[mask])
-    if float(refit_normal @ normal) < 0:
-        refit_normal, refit_offset = -refit_normal, -refit_offset
-    assert np.allclose(normal, refit_normal, atol=1e-6)
-    assert offset == pytest.approx(refit_offset, abs=1e-6)
+
+def _plane_error(normal: np.ndarray, offset: float) -> tuple[float, float]:
+    """(tilt from the true +z normal in radians, |offset| error in metres)."""
+    flip = 1.0 if normal[2] > 0 else -1.0
+    tilt = float(np.arccos(np.clip(abs(float(normal[2] * flip)), -1.0, 1.0)))
+    return tilt, abs(abs(offset) - 2.0)
+
+
+def test_ransac_plane_is_accurate_to_far_better_than_the_sample_that_won_it():
+    """The refit, not the winning triplet, is what sets the accuracy.
+
+    The old version of this test asserted that the returned plane equals the
+    least-squares fit of the returned inliers -- a tautology, and one the
+    production code was changed to satisfy (commit 4722218), so it asserted a
+    property it had itself caused.  What actually matters is that the answer
+    is *good*, and three random points from a 6 mm-thick plane are not.
+
+    Measured on this fixture (12 seeds, sigma = 6 mm, 21% outliers), taking
+    the winning minimal sample verbatim gives a worst-case tilt of 15.1 mrad
+    and a 4.9 mm offset error; refitting once brings that to 1.5 mrad /
+    0.30 mm and twice to 1.0 mrad / 0.33 mm.  The bounds below sit between
+    the two regimes, so deleting the refit fails and keeping it passes with
+    roughly 3x headroom.
+    """
+    for seed in range(6):
+        points = _noisy_plane(seed)
+        normal, offset, mask = ransac_plane(
+            points, threshold=0.03, rng=np.random.default_rng(100 + seed)
+        )
+        tilt, offset_error = _plane_error(normal, offset)
+        assert tilt < 3e-3, f"seed {seed}: plane tilted {tilt * 1e3:.2f} mrad off true"
+        assert offset_error < 1e-3, (
+            f"seed {seed}: offset off by {offset_error * 1e3:.2f} mm"
+        )
+        # The true inliers must all be recovered, and the outliers left out.
+        assert mask[:1500].all()
+        assert mask[1500:].mean() < 0.15
+
+
+def test_ransac_plane_residual_sits_at_the_noise_floor():
+    """The returned plane must fit its own inliers as well as least squares can.
+
+    That is the observable consequence of refitting: the RMS residual of the
+    returned plane over the inliers it returns drops to the injected noise
+    level.  Measured worst case over 6 seeds: 6.13 mm with the refit (sigma is
+    6.0 mm, so 1.02x), 10.96 mm without it (1.83x).
+    """
+    for seed in range(6):
+        points = _noisy_plane(seed)
+        normal, offset, mask = ransac_plane(
+            points, threshold=0.03, rng=np.random.default_rng(100 + seed)
+        )
+        residual = points[mask] @ normal + offset
+        rms = float(np.sqrt((residual**2).mean()))
+        assert rms < 1.2 * PLANE_NOISE_SIGMA, (
+            f"seed {seed}: rms residual {rms * 1e3:.2f} mm against a "
+            f"{PLANE_NOISE_SIGMA * 1e3:.1f} mm noise floor"
+        )
+        # And least squares over the same inliers cannot do materially better.
+        best_normal, best_offset = fit_plane_lsq(points[mask])
+        best = points[mask] @ best_normal + best_offset
+        assert rms <= float(np.sqrt((best**2).mean())) * 1.001
+
+
+def test_ransac_plane_answer_does_not_depend_on_which_triplet_won():
+    """Iterating the refit to a fixed point makes the result seed-independent.
+
+    This is the property that a single refit does not have.  Measured on one
+    fixed cloud over 20 different RANSAC seeds: the shipped two-refit code
+    returns bit-identical planes (spread 0.0), one refit spreads by 2.2e-4,
+    and none at all by far more.  A consumer comparing two runs of the same
+    scene should not see the plane move because a different random triplet
+    happened to score best.
+    """
+    points = _noisy_plane(0)
+    planes = []
+    for seed in range(8):
+        normal, offset, _ = ransac_plane(
+            points, threshold=0.03, rng=np.random.default_rng(seed)
+        )
+        if normal[2] < 0:
+            normal, offset = -normal, -offset
+        planes.append(np.append(normal, offset))
+    planes = np.array(planes)
+    spread = float(np.abs(planes - planes.mean(axis=0)).max())
+    assert spread < 1e-5, f"plane moved by {spread:.2e} across RANSAC seeds"
+
+
+@pytest.mark.parametrize("n_outliers", [0, 400, 1500, 3000])
+def test_ransac_plane_is_stable_across_outlier_fraction(n_outliers):
+    """Accuracy must not degrade as the plane becomes a minority of the cloud.
+
+    Measured worst case over 4 seeds each: tilt 0.49 mrad at 0% outliers
+    rising only to 1.38 mrad at 67%, offset error under 0.34 mm throughout,
+    and every true inlier recovered at every fraction.
+    """
+    for seed in range(4):
+        points = _noisy_plane(seed, n_outliers=n_outliers)
+        normal, offset, mask = ransac_plane(
+            points, threshold=0.03, rng=np.random.default_rng(200 + seed)
+        )
+        tilt, offset_error = _plane_error(normal, offset)
+        assert tilt < 3e-3, (n_outliers, seed, tilt)
+        assert offset_error < 1e-3, (n_outliers, seed, offset_error)
+        assert mask[:1500].mean() > 0.99, (n_outliers, seed)
+
+
+def test_plane_quad_corners_bound_the_points_they_were_fitted_to():
+    """The quad is what the viewer draws and what `width`/`height` report.
+
+    Checking only its area and its plane leaves the corner arithmetic free:
+    the same area can be placed anywhere on the plane.
+    """
+    rng = np.random.default_rng(41)
+    pts = np.column_stack(
+        [rng.uniform(1.0, 4.0, 3000), rng.uniform(-2.0, 0.5, 3000), np.full(3000, 1.0)]
+    )
+    quad, area = plane_quad(pts, np.array([0.0, 0.0, 1.0]), -1.0, percentile=0.0)
+
+    assert area == pytest.approx(3.0 * 2.5, rel=0.05)
+    assert np.allclose(quad[:, 2], 1.0, atol=1e-5)
+    # Every corner is at an extreme of the point set, and the point set fits
+    # inside the corners.
+    assert quad[:, 0].min() == pytest.approx(pts[:, 0].min(), abs=0.02)
+    assert quad[:, 0].max() == pytest.approx(pts[:, 0].max(), abs=0.02)
+    assert quad[:, 1].min() == pytest.approx(pts[:, 1].min(), abs=0.02)
+    assert quad[:, 1].max() == pytest.approx(pts[:, 1].max(), abs=0.02)
+    # The corners run around the rectangle rather than criss-crossing it, so
+    # adjacent edges are perpendicular and opposite edges equal.
+    edges = quad[[1, 2, 3, 0]] - quad
+    for i in range(4):
+        assert abs(float(edges[i] @ edges[(i + 1) % 4])) < 1e-3
+    assert np.linalg.norm(edges[0]) == pytest.approx(np.linalg.norm(edges[2]), rel=1e-4)
+
+
+def test_plane_quad_percentile_trims_stragglers():
+    """A handful of outliers must not stretch a wall across the whole room."""
+    rng = np.random.default_rng(42)
+    bulk = np.column_stack(
+        [rng.uniform(0, 2, 4000), rng.uniform(0, 2, 4000), np.zeros(4000)]
+    )
+    strays = np.array([[50.0, 0.0, 0.0], [-50.0, 0.0, 0.0]])
+    points = np.vstack([bulk, strays])
+    _, trimmed = plane_quad(points, np.array([0.0, 0.0, 1.0]), 0.0, percentile=1.0)
+    _, untrimmed = plane_quad(points, np.array([0.0, 0.0, 1.0]), 0.0, percentile=0.0)
+    assert trimmed == pytest.approx(4.0, rel=0.1)
+    assert untrimmed > 100.0
+
+
+def test_ransac_plane_on_degenerate_input_falls_back_to_least_squares():
+    """Collinear points give every random triplet a zero-length normal.
+
+    There is no hypothesis to score, so the only sane answer is the
+    least-squares plane through everything - and the inlier mask must still
+    describe that plane rather than being empty or full of nonsense.
+    """
+    t = np.linspace(-1.0, 1.0, 200)
+    collinear = np.column_stack([t, 2.0 * t, 3.0 * t]).astype(np.float32)
+    normal, offset, mask = ransac_plane(collinear, threshold=0.01,
+                                        rng=np.random.default_rng(0))
+    assert np.linalg.norm(normal) == pytest.approx(1.0, abs=1e-6)
+    # Every point lies on the returned plane, so every point is an inlier.
+    assert np.abs(collinear @ normal + offset).max() < 1e-5
+    assert mask.all()
+
+
+def test_ransac_plane_on_fewer_than_three_points_returns_no_inliers():
+    for count in (0, 1, 2):
+        normal, offset, mask = ransac_plane(
+            np.zeros((count, 3), np.float32), threshold=0.01
+        )
+        assert mask.shape == (count,)
+        assert not mask.any()
+        assert np.linalg.norm(normal) == pytest.approx(1.0)
+
+
+def test_backproject_with_a_single_valid_pixel():
+    """The empty-input guard must not swallow a one-pixel cloud as well."""
+    intr = CameraIntrinsics.from_hfov(8, 8, 60.0)
+    depth = np.zeros((8, 8), np.float32)
+    depth[3, 5] = 2.0
+    points, idx = backproject(DepthMap(depth=depth), intr)
+    assert points.shape == (1, 3)
+    assert idx.tolist() == [3 * 8 + 5]
+    assert points[0, 2] == pytest.approx(2.0)
+    assert points[0, 0] == pytest.approx((5 - intr.cx) / intr.fx * 2.0)
+
+
+def test_backproject_of_an_entirely_invalid_depth_map_is_empty():
+    intr = CameraIntrinsics.from_hfov(8, 8, 60.0)
+    points, idx = backproject(DepthMap(depth=np.zeros((8, 8), np.float32)), intr)
+    assert points.shape == (0, 3)
+    assert idx.size == 0
+
+
+def test_ransac_plane_degenerate_fallback_returns_the_right_offset():
+    """The collinear fallback must return the plane the points are actually on.
+
+    A line *through the origin* has offset 0, which hides sign and arithmetic
+    errors in the fallback's own inlier test; this one is deliberately offset
+    from the origin so `points @ normal + offset` is not trivially symmetric.
+    """
+    t = np.linspace(-1.0, 1.0, 200)
+    direction = np.array([1.0, 2.0, 3.0]) / np.sqrt(14.0)
+    origin = np.array([4.0, -1.5, 2.25])
+    collinear = (origin + t[:, None] * direction).astype(np.float32)
+
+    normal, offset, mask = ransac_plane(
+        collinear, threshold=0.001, rng=np.random.default_rng(0)
+    )
+    assert np.linalg.norm(normal) == pytest.approx(1.0, abs=1e-6)
+    assert abs(offset) > 0.5, "the fixture must not sit on a plane through the origin"
+    assert np.abs(collinear @ normal + offset).max() < 1e-4
+    assert mask.all()
+    # The returned plane contains the line, so its normal is perpendicular to it.
+    assert abs(float(normal @ direction)) < 1e-5
+
+
+def test_classify_plane_at_exactly_the_horizontal_threshold():
+    """HORIZONTAL_COS is inclusive: a normal exactly on it is horizontal.
+
+    Nothing else in the suite lands on the boundary, so `>=` and `>` are
+    indistinguishable everywhere else.
+    """
+    from roomviz.geometry.planes import HORIZONTAL_COS, VERTICAL_COS
+
+    up = np.array([0.0, 1.0, 0.0])
+    span = (0.0, 2.7)
+    on_threshold = np.array(
+        [np.sqrt(1.0 - HORIZONTAL_COS**2), HORIZONTAL_COS, 0.0]
+    )
+    assert float(on_threshold @ up) == pytest.approx(HORIZONTAL_COS)
+    assert classify_plane(on_threshold, 0.0, up, None, 0.05, span) == "floor"
+    assert classify_plane(on_threshold, -2.7, up, None, 2.65, span) == "ceiling"
+
+    # Just below it is slanted, not horizontal: with no labels it is dropped.
+    below = np.array([np.sqrt(1.0 - 0.84**2), 0.84, 0.0])
+    assert classify_plane(below, 0.0, up, None, 0.05, span) is None
+
+    # And VERTICAL_COS is inclusive at the other end.
+    on_vertical = np.array([np.sqrt(1.0 - VERTICAL_COS**2), VERTICAL_COS, 0.0])
+    assert classify_plane(on_vertical, 0.0, up, None, 1.3, span) == "wall"
+
+
+def test_extract_surfaces_at_exactly_the_minimum_point_count():
+    """`min_inliers` is the floor, not the first rejected value.
+
+    A cloud with exactly `min_inliers` points must still be fitted; one point
+    fewer must be refused rather than fitted from too little evidence.
+    """
+    rng = np.random.default_rng(51)
+    n = 600
+    points = np.column_stack(
+        [rng.uniform(0, 3, n), rng.normal(0, 0.003, n), rng.uniform(0, 3, n)]
+    ).astype(np.float32)
+    kinds = ["floor"] * n
+
+    fitted, _ = extract_surfaces(
+        points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,
+        threshold=0.02, min_inliers=n, max_planes=4,
+    )
+    assert len(fitted) == 1 and fitted[0].kind == "floor"
+
+    refused, assignment = extract_surfaces(
+        points, up=np.array([0.0, 1.0, 0.0]), labels=kinds,
+        threshold=0.02, min_inliers=n + 1, max_planes=4,
+    )
+    assert refused == []
+    assert (assignment == -1).all()
+
+
+def test_median_spacing_needs_two_points_and_no_more():
+    """The guard is `n < 2`, so two points already have a spacing."""
+    from roomviz.geometry.pointcloud import median_spacing
+
+    assert median_spacing(np.zeros((0, 3), np.float32)) == 0.0
+    assert median_spacing(np.zeros((1, 3), np.float32)) == 0.0
+    pair = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]], np.float32)
+    assert median_spacing(pair) == pytest.approx(0.25, abs=1e-6)
+
+
+def test_sets_are_connected_is_inclusive_at_exactly_the_gap():
+    """Two objects exactly `gap` apart are touching, by definition of the gap."""
+    from roomviz.geometry.pointcloud import sets_are_connected
+
+    # 0.125 is exact in binary floating point, so "exactly the gap" really is.
+    a = np.zeros((1, 3), np.float32)
+    b = np.array([[0.125, 0.0, 0.0]], np.float32)
+    assert sets_are_connected(a, b, gap=0.125) is True
+    assert sets_are_connected(a, b, gap=0.124) is False
+    # Empty input is never connected, whatever the gap.
+    assert sets_are_connected(np.zeros((0, 3), np.float32), b, gap=100.0) is False
+
+
+def test_statistical_outlier_removal_keeps_the_bulk_and_drops_the_stragglers():
+    """`std_ratio` is a real threshold, not decoration.
+
+    A dense blob plus a few points parked far away: the blob must survive
+    intact at the shipped 2.0, and widening the ratio must let the stragglers
+    back in - which is what pins the constant.
+    """
+    from roomviz.geometry.pointcloud import remove_statistical_outliers
+
+    rng = np.random.default_rng(52)
+    blob = rng.normal(0, 0.02, (600, 3))
+    strays = rng.normal(0, 0.02, (6, 3)) + np.array([1.5, 0.0, 0.0])
+    points = np.vstack([blob, strays]).astype(np.float32)
+
+    keep = remove_statistical_outliers(points, k=12, std_ratio=2.0)
+    assert keep[:600].mean() > 0.98, keep[:600].mean()
+    assert not keep[600:].any()
+    # A very wide ratio keeps everything; a very narrow one cannot keep all.
+    assert remove_statistical_outliers(points, k=12, std_ratio=50.0).all()
+    assert not remove_statistical_outliers(points, k=12, std_ratio=0.05).all()
+    # Too few points to judge: keep them all rather than delete the cloud.
+    assert remove_statistical_outliers(np.zeros((5, 3), np.float32), k=12).all()

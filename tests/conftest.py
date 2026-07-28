@@ -7,3 +7,11 @@ ROOT = Path(__file__).resolve().parent.parent
 for path in (ROOT, ROOT / "tests"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: full pipeline runs measured in seconds each; deselect with "
+        "-m 'not slow'",
+    )

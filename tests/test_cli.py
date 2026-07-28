@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import cv2
 import numpy as np
@@ -153,3 +154,179 @@ def test_viewer_assets_are_self_contained(capture, tmp_path):
     assert (out_dir / "vendor" / "three.module.js").stat().st_size > 100_000
     assert (out_dir / "vendor" / "jsm" / "controls" / "OrbitControls.js").exists()
     assert (out_dir / "vendor" / "jsm" / "utils" / "BufferGeometryUtils.js").exists()
+
+
+# --------------------------------------------------------------------------
+# error paths and the `view` server
+#
+# `run_cli` above only ever exercises the happy path.  Everything below is what
+# a user hits when something is wrong, which is when the CLI's behaviour
+# actually matters: it must give an exit code and a message, never a traceback.
+# --------------------------------------------------------------------------
+
+def test_no_arguments_prints_help_and_succeeds(capsys):
+    assert main([]) == 0
+    assert "Reconstruct an interactive 3D" in capsys.readouterr().out
+
+
+def test_a_bad_configuration_exits_two_with_a_message(capture, tmp_path, capsys):
+    """`--voxel 0` collapses the cloud to one point; validation must refuse it."""
+    code = run_cli(capture, tmp_path / "out", "--voxel", "0")
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "error:" in err and "voxel_size" in err
+
+
+def test_an_impossible_field_of_view_exits_two(capture, tmp_path, capsys):
+    """`--hfov 0` divides by tan(0) and writes a literal Infinity into JSON."""
+    _, video, depth_dir, seg_dir, _, _ = capture
+    code = main(
+        [
+            "reconstruct", str(video), "-o", str(tmp_path / "out"),
+            "--depth-backend", "file", "--depth-dir", str(depth_dir),
+            "--seg-backend", "file", "--seg-dir", str(seg_dir),
+            "--hfov", "0",
+        ]
+    )
+    assert code == 2
+    assert "hfov" in capsys.readouterr().err
+
+
+def test_a_missing_sidecar_directory_exits_cleanly(capture, tmp_path, capsys):
+    _, video, _, seg_dir, _, hfov = capture
+    code = main(
+        [
+            "reconstruct", str(video), "-o", str(tmp_path / "out"),
+            "--depth-backend", "file", "--depth-dir", str(tmp_path / "absent"),
+            "--seg-backend", "file", "--seg-dir", str(seg_dir),
+            "--hfov", str(hfov),
+        ]
+    )
+    assert code == 2
+    assert "error:" in capsys.readouterr().err
+
+
+def test_an_assumed_camera_is_printed_as_a_caveat(capture, tmp_path, capsys):
+    """No --hfov and no EXIF (video carries none): the summary must say so."""
+    _, video, depth_dir, seg_dir, _, _ = capture
+    code = main(
+        [
+            "reconstruct", str(video), "-o", str(tmp_path / "assumed"),
+            "--depth-backend", "file", "--depth-dir", str(depth_dir),
+            "--seg-backend", "file", "--seg-dir", str(seg_dir),
+            "--max-side", "320", "--no-glb", "--no-viewer", "--no-ply",
+        ]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "ASSUMED" in out
+    assert "caveats" in out
+    assert "camera_assumed" in out
+
+
+def test_the_summary_reports_a_measured_camera_and_every_dimension(
+    capture, tmp_path, capsys
+):
+    """One run, two claims: the camera provenance and the printed summary.
+
+    Merged into a single reconstruction on purpose - each CLI run costs about
+    five seconds, and neither half needs its own.
+    """
+    assert run_cli(capture, tmp_path / "summary", "--no-glb", "--no-viewer") == 0
+    out = capsys.readouterr().out
+    # The camera was given, so it must not be reported as guessed.
+    assert "from --hfov" in out
+    assert "ASSUMED" not in out
+    assert "95 deg horizontal FOV" in out
+    # ... and the summary states its units and lists everything it found.
+    assert "sizes are width x height x depth, in metres" in out
+    for label in ("sofa", "table", "chair", "bookcase"):
+        assert label in out
+    assert "width x height, metres" in out
+    assert "floor" in out
+    # It says where the output went and how long it took, which is the only
+    # confirmation a scripted run gets.
+    assert re.search(r"Reconstructed \S*summary in \d+\.\d+s", out), out
+    # Each object line carries its own point count, not a constant.
+    counts = [int(m.replace(",", "")) for m in re.findall(r"\(([\d,]+) pts\)", out)]
+    assert len(counts) == 4
+    assert all(c > 100 for c in counts), counts
+    assert len(set(counts)) > 1, counts
+
+
+def _serve_once(monkeypatch):
+    """Make `serve` return instead of blocking, so its setup path is testable."""
+    import socketserver
+
+    def stop(self, *args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(socketserver.TCPServer, "serve_forever", stop)
+
+
+def test_view_walks_up_from_a_busy_port(tmp_path, monkeypatch, capsys):
+    """README: `roomviz view` "walks up a few ports if the one you asked for is
+    busy" - a stale server from an earlier run is the normal case."""
+    import socket
+
+    from roomviz.cli import serve
+
+    _serve_once(monkeypatch)
+    (tmp_path / "viewer.html").write_text("<html></html>")
+
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    port = blocker.getsockname()[1]
+    blocker.listen(1)
+    try:
+        serve(tmp_path, port=port, open_browser=False)
+    finally:
+        blocker.close()
+
+    out = capsys.readouterr().out
+    assert f"port {port} was busy; using {port + 1}" in out
+    assert f"http://127.0.0.1:{port + 1}/viewer.html" in out
+
+
+def test_view_reports_a_missing_viewer_without_refusing_to_serve(
+    tmp_path, monkeypatch, capsys
+):
+    from roomviz.cli import serve
+
+    _serve_once(monkeypatch)
+    serve(tmp_path, port=0, open_browser=False)
+    captured = capsys.readouterr()
+    assert "no viewer.html" in captured.err
+    assert "serving" in captured.out
+
+
+def test_view_gives_up_cleanly_when_every_port_is_taken(tmp_path, monkeypatch, capsys):
+    import socket
+
+    from roomviz.cli import serve
+
+    _serve_once(monkeypatch)
+    first = socket.socket()
+    first.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    first.bind(("127.0.0.1", 0))
+    base = first.getsockname()[1]
+    first.listen(1)
+    blockers = [first]
+    try:
+        for offset in range(1, 20):
+            sock = socket.socket()
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1", base + offset))
+                sock.listen(1)
+                blockers.append(sock)
+            except OSError:
+                sock.close()  # already taken by something else; equally blocking
+        with pytest.raises(SystemExit) as excinfo:
+            serve(tmp_path, port=base, open_browser=False)
+    finally:
+        for sock in blockers:
+            sock.close()
+    assert excinfo.value.code == 2
+    assert "no free port" in capsys.readouterr().err

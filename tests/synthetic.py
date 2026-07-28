@@ -99,7 +99,19 @@ def _hash3(cells: np.ndarray) -> np.ndarray:
     return ((x ^ (x >> np.int64(16))) & np.int64(0xFFFF)).astype(np.float64) / 65535.0
 
 
-def _texture(points: np.ndarray, base: np.ndarray, cell: float = 0.045) -> np.ndarray:
+TEXTURE_AMPLITUDE = 0.45
+"""Default peak-to-peak contrast of the surface texture, as a fraction of the
+base albedo.  Everything ORB has to work with comes from this; see
+``tests/test_harness_cliffs.py`` for the measured amplitude at which the
+harness stops reconstructing."""
+
+
+def _texture(
+    points: np.ndarray,
+    base: np.ndarray,
+    cell: float = 0.045,
+    amplitude: float = TEXTURE_AMPLITUDE,
+) -> np.ndarray:
     """Deterministic random-dot texture keyed to world position.
 
     Real photos give ORB plenty of corners to match; flat shading gives it
@@ -110,7 +122,7 @@ def _texture(points: np.ndarray, base: np.ndarray, cell: float = 0.045) -> np.nd
     view-consistent, so it behaves like real surface detail.
     """
     cells = np.floor(points / cell).astype(np.int64)
-    modulation = 1.0 + 0.45 * (_hash3(cells)[:, None] - 0.5)
+    modulation = 1.0 + amplitude * (_hash3(cells)[:, None] - 0.5)
     return np.clip(base * modulation, 0, 255)
 
 
@@ -143,7 +155,10 @@ def _ray_room_exit(
 
 
 def render(
-    room: Room, pose: np.ndarray, intr: CameraIntrinsics
+    room: Room,
+    pose: np.ndarray,
+    intr: CameraIntrinsics,
+    texture_amplitude: float = TEXTURE_AMPLITUDE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Render one view.  Returns ``(rgb uint8, depth float32, segment ids)``."""
     h, w = intr.height, intr.width
@@ -192,7 +207,11 @@ def render(
         base[closer] = np.array(box.color, float)
 
     points = origin + dirs * best_t[:, None]
-    rgb = _texture(points, base).astype(np.uint8).reshape(h, w, 3)
+    rgb = (
+        _texture(points, base, amplitude=texture_amplitude)
+        .astype(np.uint8)
+        .reshape(h, w, 3)
+    )
     depth = best_t.astype(np.float32).reshape(h, w)
     return rgb, depth, seg.reshape(h, w)
 
@@ -228,19 +247,33 @@ def segmentation_for(
     return Segmentation(ids=ids.astype(np.int32), segments=segments)
 
 
-def orbit_poses(room: Room, count: int = 6) -> list[np.ndarray]:
+PATH_SPAN = 1.4
+"""Default horizontal travel (m) of the camera sweep.  Parallax - and hence
+everything odometry can recover - scales with this."""
+
+FRAME_COUNT = 6
+"""Default number of views in the sweep."""
+
+
+def orbit_poses(
+    room: Room, count: int = FRAME_COUNT, span: float = PATH_SPAN
+) -> list[np.ndarray]:
     """A camera sweep along the near wall, converging on the room centre.
 
     The path is chosen so every piece of furniture stays fully inside the
     frame in every view - which is what lets the tests assert on true object
     dimensions rather than on whatever happened to be visible - while still
     translating enough to give odometry real parallax to work with.
+
+    ``count`` and ``span`` are exposed so the suite can measure how much of
+    either the pipeline actually needs, rather than assuming the shipped
+    values sit anywhere in particular relative to the failure point.
     """
     poses = []
     for i in range(count):
         s = i / max(1, count - 1)
         eye = np.array(
-            [1.8 + 1.4 * s, 1.55 + 0.05 * np.sin(s * 5.0), 0.15 + 0.15 * s]
+            [1.8 + span * s, 1.55 + 0.05 * np.sin(s * 5.0), 0.15 + 0.15 * s]
         )
         target = np.array([2.4 + 0.25 * (s - 0.5), 0.75, 2.7])
         poses.append(look_at(eye, target))
@@ -253,6 +286,9 @@ def render_sequence(
     width: int = 224,
     height: int = 168,
     hfov: float = 70.0,
+    texture_amplitude: float = TEXTURE_AMPLITUDE,
+    frame_count: int = FRAME_COUNT,
+    path_span: float = PATH_SPAN,
 ) -> tuple[Room, CameraIntrinsics, list[np.ndarray], list[Frame], list[np.ndarray], list[Segmentation]]:
     """Render a whole sequence.
 
@@ -260,11 +296,12 @@ def render_sequence(
     """
     room = room or default_room()
     intr = CameraIntrinsics.from_hfov(width, height, hfov)
-    poses = poses if poses is not None else orbit_poses(room)
+    if poses is None:
+        poses = orbit_poses(room, count=frame_count, span=path_span)
 
     frames, depths, segmentations = [], [], []
     for i, pose in enumerate(poses):
-        rgb, depth, ids = render(room, pose, intr)
+        rgb, depth, ids = render(room, pose, intr, texture_amplitude=texture_amplitude)
         frames.append(Frame(index=i, rgb=rgb, timestamp=float(i), source="synthetic"))
         depths.append(depth)
         segmentations.append(segmentation_for(ids, room))
