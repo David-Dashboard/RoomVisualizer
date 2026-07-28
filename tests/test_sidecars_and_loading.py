@@ -548,3 +548,71 @@ def test_a_fractional_sharpness_threshold_still_filters(tmp_path):
     assert kept(0.5) == [0, 2, 4, 6, 8, 10]
     # ... and zero means "keep everything", which is the documented off switch.
     assert kept(0.0) == list(range(12))
+
+
+def _clip(tmp_path, seconds: float, fps: int = 30, name: str = "clip.mp4"):
+    path = tmp_path / name
+    rng = np.random.default_rng(0)
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (64, 64))
+    for _ in range(int(seconds * fps)):
+        writer.write(rng.integers(0, 255, (64, 64, 3), dtype=np.uint8))
+    writer.release()
+    return path
+
+
+def test_sparse_keyframes_are_warned_about(tmp_path, caplog):
+    """Spreading a fixed frame budget over a long clip breaks tracking.
+
+    The failure this prevents surfaces nowhere near its cause: consecutive
+    keyframes stop overlapping, every pose link degrades, and what the user
+    sees is a scene with hundreds of duplicated objects and no floor.
+    """
+    video = _clip(tmp_path, seconds=30)
+    with caplog.at_level("WARNING"):
+        load_frames(video, PipelineConfig(max_frames=24, max_side=64))
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("keyframe every" in w for w in warnings), warnings
+    # It must name a usable remedy, not just complain.
+    assert any("--max-frames" in w for w in warnings), warnings
+
+
+def test_dense_keyframes_are_not_warned_about(tmp_path, caplog):
+    """The control: a warning that always fires would be ignored."""
+    video = _clip(tmp_path, seconds=30, name="dense.mp4")
+    with caplog.at_level("WARNING"):
+        load_frames(video, PipelineConfig(max_frames=90, max_side=64))
+    assert not [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "keyframe every" in r.getMessage()
+    ]
+
+
+def test_a_short_clip_is_never_warned_about(tmp_path, caplog):
+    """Three seconds into 24 frames is 8 fps - comfortably trackable."""
+    video = _clip(tmp_path, seconds=3, name="short.mp4")
+    with caplog.at_level("WARNING"):
+        load_frames(video, PipelineConfig(max_frames=24, max_side=64))
+    assert not [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "keyframe every" in r.getMessage()
+    ]
+
+
+def test_the_suggested_frame_count_would_actually_clear_the_threshold(tmp_path, caplog):
+    """The number in the advice has to be one that silences the warning."""
+    import re
+
+    video = _clip(tmp_path, seconds=30, name="advice.mp4")
+    with caplog.at_level("WARNING"):
+        load_frames(video, PipelineConfig(max_frames=24, max_side=64))
+    message = next(m for m in (r.getMessage() for r in caplog.records)
+                   if "--max-frames" in m)
+    suggested = int(re.search(r"--max-frames (\d+)", message).group(1))
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        load_frames(video, PipelineConfig(max_frames=suggested, max_side=64))
+    assert not [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "keyframe every" in r.getMessage()
+    ], f"taking the advice ({suggested}) still warns"

@@ -122,6 +122,48 @@ def _read_image(path: Path) -> np.ndarray:
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
+MAX_TRACKABLE_GAP_SECONDS = 0.5
+"""Longest gap between keyframes that frame-to-frame tracking can bridge.
+
+Odometry matches ORB features between *consecutive keyframes*, so what matters
+is not how many frames were sampled but how much the view changed between the
+ones that were.  Half a second of ordinary handheld panning still leaves a
+large shared field of view; several seconds of walking does not, and the
+tracker then has nothing to match.  This is a guide rather than a limit -
+a slow orbit survives a longer gap than a walk through a doorway - so it warns
+rather than refusing.
+"""
+
+
+def _warn_if_keyframes_are_too_far_apart(
+    stride: int, fps: float, total: int, cfg: PipelineConfig
+) -> None:
+    """Say so when the sampling makes the camera untrackable.
+
+    ``max_frames`` spreads its budget over the whole clip, so the longer the
+    video the further apart the keyframes: a 60-second walkthrough at the
+    default 24 frames is one keyframe every 2.5 seconds.  Consecutive
+    keyframes then share almost no features, every pose link fails or solves
+    badly, and the failure surfaces far downstream as a scene where nothing
+    merges across frames - hundreds of duplicated objects and no floor - with
+    nothing pointing back at the sampling.
+    """
+    if total <= 0 or fps <= 0 or stride <= 1:
+        return
+    gap = stride / fps
+    if gap <= MAX_TRACKABLE_GAP_SECONDS:
+        return
+    suggested = max(cfg.max_frames, int(np.ceil(total / (MAX_TRACKABLE_GAP_SECONDS * fps))))
+    log.warning(
+        "Sampling one keyframe every %.1f s (%.0f s of video into %d frames). "
+        "Camera tracking matches features between consecutive keyframes, and "
+        "much beyond %.1f s they no longer overlap - poses drift or fail, and "
+        "the same object reconstructs several times over. Pass --max-frames %d "
+        "for this clip, or film a shorter, slower pass.",
+        gap, total / fps, cfg.max_frames, MAX_TRACKABLE_GAP_SECONDS, suggested,
+    )
+
+
 def _load_video_frames(source: MediaSource, cfg: PipelineConfig) -> list[Frame]:
     cap = cv2.VideoCapture(str(source.path))
     if not cap.isOpened():
@@ -134,6 +176,7 @@ def _load_video_frames(source: MediaSource, cfg: PipelineConfig) -> list[Frame]:
         stride = max(1, int(np.ceil(total / max(1, cfg.max_frames)))) if total > 0 else 1
 
     fps = source.fps or 30.0
+    _warn_if_keyframes_are_too_far_apart(stride, fps, total, cfg)
     frames: list[Frame] = []
     raw_index = 0
     kept = 0
