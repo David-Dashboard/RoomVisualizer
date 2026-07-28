@@ -437,6 +437,57 @@ def test_objects_are_not_silently_shrunk(scene):
         )
 
 
+def test_observed_floor_area_is_labelled_as_observed(scene, tmp_path):
+    """The floor patch is not the room's floor area, and must not claim to be.
+
+    Filming half a room halves this number with no other symptom, so two
+    captures of the same room legitimately disagree.  The field name and an
+    explicit coverage figure are what stop it being read as gross area.
+    """
+    from roomviz.export.scene_json import build_scene_dict
+
+    reconstructed, room, cfg = scene
+    payload = build_scene_dict(reconstructed, cfg)
+
+    assert "floor_area" not in payload["room"], "the bare name invites misreading"
+    observed = payload["room"]["observed_floor_area"]
+    true_area = room.width * room.depth
+    # The camera cannot see the whole floor from this trajectory, so the
+    # observed patch must be a strict under-estimate -- that is the point.
+    assert observed < true_area
+    assert payload["room"]["floor_area_is_observed_only"] is True
+    assert 0.0 < payload["room"]["floor_coverage"] <= 1.0
+
+
+def test_caveats_are_machine_readable(rendered):
+    """Warnings that only reach stderr are invisible to a batch pipeline."""
+    from roomviz.export.scene_json import build_scene_dict
+
+    _, intr, _, frames, depths, segs = rendered
+    cfg = build_config()
+    depth_maps = [DepthMap(depth=d) for d in depths]
+    poses = estimate_trajectory(frames, depth_maps, intr, cfg)
+    observations = [
+        Observation(frame=f, depth=d, segmentation=s, intrinsics=intr, pose=p)
+        for f, d, s, p in zip(frames, depth_maps, segs, poses, strict=True)
+    ]
+    good = build_scene_dict(fuse(observations, cfg), cfg)
+    assert isinstance(good["caveats"], list)
+    assert not any(c.startswith("implausible_height") for c in good["caveats"])
+    assert not any(c.startswith("camera_assumed") for c in good["caveats"])
+
+    # A guessed camera must be declared in the file, not just on stderr.
+    intr.provenance = "assumed_default"
+    guessed = build_scene_dict(fuse(observations, cfg), cfg)
+    assert any(c.startswith("camera_assumed") for c in guessed["caveats"])
+
+    # So must an unaligned scene.
+    unaligned_cfg = build_config(align_gravity=False)
+    unaligned = build_scene_dict(fuse(observations, unaligned_cfg), unaligned_cfg)
+    assert any(c.startswith("not_gravity_aligned") for c in unaligned["caveats"])
+    assert unaligned["up_axis"] != "+Y"
+
+
 def test_default_config_still_reconstructs(rendered):
     """The shipped defaults must work, not just the tuned test config.
 

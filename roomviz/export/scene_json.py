@@ -31,7 +31,18 @@ def _room_dimensions(scene: Scene) -> dict[str, Any]:
     floors = [s for s in scene.surfaces if s.kind == "floor"]
     ceilings = [s for s in scene.surfaces if s.kind == "ceiling"]
     if floors:
-        out["floor_area"] = round(float(floors[0].area), 3)
+        # This is the area of the floor *that was observed*, not the room's
+        # floor area.  They are very different numbers: filming half a room
+        # halves this, with no other symptom.  Two people filming the same
+        # room on different phones get different values, both "correct".
+        observed = float(floors[0].area)
+        out["observed_floor_area"] = round(observed, 3)
+        # A crude upper bound on the room from the reconstruction's own
+        # horizontal extent, so a consumer can see how much is missing.
+        footprint = float((hi[0] - lo[0]) * (hi[2] - lo[2]))
+        if footprint > 1e-6:
+            out["floor_coverage"] = round(min(1.0, observed / footprint), 3)
+        out["floor_area_is_observed_only"] = True
     if floors and ceilings:
         # Both planes are horizontal after alignment, so their height gap is
         # just the difference of the plane offsets along the up axis.
@@ -117,6 +128,37 @@ def build_scene_dict(scene: Scene, cfg: PipelineConfig | None = None) -> dict[st
         payload["config"] = cfg.to_dict()
         payload["config"].pop("extra", None)
     payload["meta"] = {k: v for k, v in scene.meta.items()}
+
+    # Caveats belong in the artefact, not only on stderr.  An overnight batch
+    # writes stderr to a log nobody reads; anything that should hold a result
+    # back for review has to be machine-readable.
+    caveats: list[str] = []
+    if scene.intrinsics is not None and scene.intrinsics.provenance == "assumed_default":
+        caveats.append(
+            "camera_assumed: no intrinsics or EXIF; every dimension scales with "
+            "an assumed field of view"
+        )
+    if not payload["summary"]["surfaces_by_kind"].get("ceiling"):
+        caveats.append("no_ceiling: room height could not be measured")
+    if not payload["summary"]["surfaces_by_kind"].get("floor"):
+        caveats.append("no_floor: floor area unavailable and alignment is less certain")
+    coverage = payload["room"].get("floor_coverage")
+    if coverage is not None and coverage < 0.8:
+        caveats.append(
+            f"partial_floor: only about {coverage:.0%} of the reconstruction's "
+            "footprint was observed as floor; observed_floor_area is a lower bound"
+        )
+    height = payload["room"]["extent"][1]
+    if not 1.9 <= height <= 6.0:
+        caveats.append(
+            f"implausible_height: {height:.2f} m floor-to-ceiling suggests the "
+            "scene is mis-scaled"
+        )
+    if not bool(scene.meta.get("aligned", True)):
+        caveats.append("not_gravity_aligned: sizes are measured in the camera frame")
+    if not bool(scene.meta.get("metric_depth", True)):
+        caveats.append("relative_depth: absolute scale is assumed, not measured")
+    payload["caveats"] = caveats
     return payload
 
 

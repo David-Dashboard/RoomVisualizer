@@ -35,7 +35,8 @@ output/
 ```json
 {
   "up_axis": "+Y", "units": "metres",
-  "room": { "floor_area": 14.3, "room_height": 2.7, "extent": [5.0, 2.7, 4.0] },
+  "room": { "observed_floor_area": 14.3, "floor_coverage": 0.72,
+            "room_height": 2.7, "extent": [5.0, 2.7, 4.0] },
   "objects": [
     { "instance_id": 0, "label": "sofa", "size": [1.40, 0.63, 1.16],
       "centroid": [3.98, 0.31, 3.09], "observations": 8,
@@ -50,6 +51,17 @@ output/
 
 Objects are toggled individually in the viewer, or loaded straight into
 Blender / MeshLab / anything that reads glTF or PLY.
+
+**`observed_floor_area` is not the room's floor area.** It is the area of the
+floor the camera actually saw — film half a room and it halves, with no other
+symptom. In the example above the room is 5.0 x 4.0 m (20 m²) and only 14.3 m²
+of floor was in shot. `floor_coverage` tells you how much is missing. If you
+need gross internal area, this is a lower bound, not an answer.
+
+`caveats` is a machine-readable list of everything that should make you
+distrust a result — an assumed camera, a missing ceiling, partial floor
+coverage, an implausible room height. Check it in any batch pipeline; the
+equivalent warnings go to stderr, which nobody reads overnight.
 
 ---
 

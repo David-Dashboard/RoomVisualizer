@@ -332,6 +332,14 @@ def main(argv: list[str] | None = None) -> int:
             f"      [{surface.surface_id:>3}] {surface.kind:<10}"
             f" {width:5.2f} x {height:5.2f} m   area {surface.area:6.2f} m2"
         )
+    from .export.scene_json import build_scene_dict
+
+    caveats = build_scene_dict(scene, cfg).get("caveats", [])
+    if caveats:
+        print()
+        print("  caveats  :")
+        for caveat in caveats:
+            print(f"      - {caveat}")
     print()
     print(f"  open the viewer with:  roomviz view {result.output_dir}")
 
