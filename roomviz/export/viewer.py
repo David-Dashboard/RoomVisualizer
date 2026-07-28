@@ -30,7 +30,7 @@ VIEWER_HTML = """<!doctype html>
   html, body { margin: 0; height: 100%; overflow: hidden;
     background: var(--bg); color: var(--text);
     font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
-  #stage { position: absolute; inset: 0; }
+  #stage { position: absolute; top: 0; left: 0; right: 310px; bottom: 0; }
   #panel { position: absolute; top: 0; right: 0; bottom: 0; width: 310px;
     background: var(--panel); border-left: 1px solid var(--line);
     display: flex; flex-direction: column; z-index: 10; }
@@ -57,30 +57,48 @@ VIEWER_HTML = """<!doctype html>
   #error { position: absolute; inset: 0; display: none; place-content: center;
     padding: 40px; text-align: center; color: var(--muted); z-index: 20; }
   #error code { color: var(--accent); }
+  .visually-hidden { position: absolute; width: 1px; height: 1px; margin: -1px;
+    padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .obj { font: inherit; color: inherit; background: none; border: 0;
+    width: 100%; text-align: left; }
+  .obj:focus-visible, canvas:focus-visible { outline: 2px solid var(--accent);
+    outline-offset: 2px; }
+  /* Swatches are the only key linking a row to a shape, so they must survive
+     forced-colors mode, where every background is otherwise overridden. */
+  @media (forced-colors: active) {
+    .swatch { forced-color-adjust: none; border: 1px solid ButtonText; }
+  }
   @media (max-width: 720px), (max-height: 560px) {
     /* Scroll the whole panel rather than only the object list: at phone
        heights the fixed groups leave the list a couple of rows tall, so its
        own scrollbar is not enough to reach the objects comfortably. */
     #panel { width: 100%; height: 55%; top: auto; overflow-y: auto; }
+    /* And stop the stage from extending underneath it.  With `inset: 0` the
+       canvas filled the viewport and the camera framed the room at the
+       vertical centre -- which is exactly where the opaque panel sits, so on
+       a phone the room was rendered entirely behind it. */
+    #stage { right: 0; bottom: 55%; }
     #objects { flex: none; min-height: auto; overflow: visible; }
     #hint { display: none; }
   }
 </style>
 </head>
 <body>
-<div id="stage"></div>
-<div id="hint">drag to orbit &middot; scroll to zoom &middot; right-drag to pan &middot; click an object to frame it</div>
-<div id="error">
+<main id="stage" aria-label="3D scene">
+  <p id="scene-description" class="visually-hidden">Loading the scene&hellip;</p>
+</main>
+<div id="hint">drag or arrow keys to orbit &middot; scroll or +/- to zoom &middot; right-drag to pan &middot; click or Enter on an object to frame it &middot; Home resets</div>
+<div id="error" role="alert">
   <div>
     <p id="reason">Could not load the scene.</p>
     <p>Serve this folder over HTTP:</p>
     <p><code>roomviz view .</code> &nbsp;or&nbsp; <code>python -m http.server</code></p>
   </div>
 </div>
-<aside id="panel">
+<aside id="panel" aria-label="Scene controls">
   <header>
     <h1>RoomVisualizer</h1>
-    <div id="stats">loading&hellip;</div>
+    <div id="stats" role="status" aria-live="polite">loading&hellip;</div>
   </header>
   <div class="group">
     <h2>Layers</h2>
@@ -93,12 +111,13 @@ VIEWER_HTML = """<!doctype html>
   </div>
   <div class="group">
     <h2>Point size</h2>
-    <input type="range" id="point-size" min="1" max="12" step="0.5" value="3">
+    <input type="range" id="point-size" min="1" max="12" step="0.5" value="3"
+           aria-label="Point size">
   </div>
   <div class="group" style="border-bottom:none; padding-bottom:4px">
     <h2>Objects</h2>
   </div>
-  <div id="objects"></div>
+  <div id="objects" role="list"></div>
 </aside>
 
 <script>
@@ -158,7 +177,49 @@ scene.add(key);
 
 const camera = new THREE.PerspectiveCamera(55, 1, 0.02, 500);
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
+// Inertial glide is motion the user did not ask for; honour their preference.
+controls.enableDamping =
+  !matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// The canvas is the product, so it has to be reachable and drivable without a
+// mouse.  OrbitControls already ships arrow-key panning; orbit and zoom are
+// wired explicitly below.
+renderer.domElement.tabIndex = 0;
+renderer.domElement.setAttribute('role', 'application');
+renderer.domElement.setAttribute('aria-label',
+  '3D room view. Arrow keys orbit, plus and minus zoom, Home resets the view.');
+renderer.domElement.setAttribute('aria-describedby', 'scene-description');
+controls.listenToKeyEvents(renderer.domElement);
+
+const ORBIT_STEP = Math.PI / 24;   // 7.5 degrees
+function orbitBy(dTheta, dPhi) {
+  const offset = camera.position.clone().sub(controls.target);
+  const spherical = new THREE.Spherical().setFromVector3(offset);
+  spherical.theta += dTheta;
+  spherical.phi = Math.max(0.05, Math.min(Math.PI - 0.05, spherical.phi + dPhi));
+  camera.position.copy(controls.target).add(
+    new THREE.Vector3().setFromSpherical(spherical));
+  controls.update();
+}
+function zoomBy(factor) {
+  const offset = camera.position.clone().sub(controls.target);
+  camera.position.copy(controls.target).add(offset.multiplyScalar(factor));
+  controls.update();
+}
+renderer.domElement.addEventListener('keydown', (event) => {
+  if (event.altKey || event.ctrlKey || event.metaKey) return;
+  const handlers = {
+    ArrowLeft: () => orbitBy(-ORBIT_STEP, 0),
+    ArrowRight: () => orbitBy(ORBIT_STEP, 0),
+    ArrowUp: () => orbitBy(0, -ORBIT_STEP),
+    ArrowDown: () => orbitBy(0, ORBIT_STEP),
+    '+': () => zoomBy(0.85), '=': () => zoomBy(0.85), PageUp: () => zoomBy(0.85),
+    '-': () => zoomBy(1.18), PageDown: () => zoomBy(1.18),
+    Home: () => frameBox(new THREE.Box3().setFromObject(scene)),
+  };
+  const handler = handlers[event.key];
+  if (handler) { event.preventDefault(); handler(); }
+});
 
 // Buckets of nodes, filled in as the glTF is walked.
 const layers = { cloud: [], objects: [], boxes: [], walls: [], floor: [] };
@@ -186,6 +247,7 @@ function applyPointSize(size) {
 }
 
 function frameBox(box, padding = 1.35) {
+  framedBounds = box;
   const size = box.getSize(new THREE.Vector3());
   const center = box.getCenter(new THREE.Vector3());
   const radius = Math.max(size.length() / 2, 0.25) * padding;
@@ -203,8 +265,12 @@ function buildObjectList(meta) {
   const host = document.getElementById('objects');
   host.innerHTML = '';
   for (const obj of meta.objects) {
-    const row = document.createElement('div');
+    // A real button, not a div: the object list is the only way a keyboard
+    // user can inspect anything, so it has to be focusable and operable.
+    const row = document.createElement('button');
+    row.type = 'button';
     row.className = 'obj';
+    row.setAttribute('role', 'listitem');
     const [w, h, d] = obj.size;
     // Labels come from scene.json, which comes from a user-supplied labels.json
     // or a checkpoint's id2label -- untrusted text.  Build the row with
@@ -220,11 +286,18 @@ function buildObjectList(meta) {
     size.className = 'size';
     size.textContent = `${w.toFixed(2)}x${h.toFixed(2)}x${d.toFixed(2)}m`;
     row.replaceChildren(swatch, name, size);
-    row.title = `${obj.point_count} points, seen in ${obj.observations} frame(s)`;
+    const detail = `${obj.point_count} points, seen in ${obj.observations} frame(s)`;
+    row.title = detail;
+    // title= is a mouse tooltip; the accessible name has to carry it too.
+    row.setAttribute('aria-label',
+      `${String(obj.label).split(';')[0]}, ` +
+      `${w.toFixed(2)} by ${h.toFixed(2)} by ${d.toFixed(2)} metres. ${detail}. ` +
+      `Activate to frame this object.`);
     row.addEventListener('click', () => {
       const node = byInstance.get(obj.instance_id);
       if (!node) return;
       frameBox(new THREE.Box3().setFromObject(node));
+      announce(`Framed ${String(obj.label).split(';')[0]}.`);
     });
     host.appendChild(row);
   }
@@ -232,6 +305,56 @@ function buildObjectList(meta) {
 
 function setVisible(bucket, visible) {
   for (const node of layers[bucket]) node.visible = visible;
+}
+
+function announce(message) {
+  // #stats is the page's live region; reuse it for transient confirmations.
+  const stats = document.getElementById('stats');
+  stats.textContent = message;
+  clearTimeout(announce._timer);
+  announce._timer = setTimeout(() => { stats.textContent = summaryText; }, 4000);
+}
+let summaryText = '';
+
+function describeScene(meta) {
+  // Everything needed for a genuine text alternative is already in
+  // scene.json; without this the visualisation is simply absent from the
+  // accessibility tree.
+  const room = meta.room || {};
+  const extent = room.extent || [0, 0, 0];
+  const parts = [
+    `3D view of a room about ${extent[0].toFixed(1)} by ${extent[2].toFixed(1)} ` +
+    `metres and ${extent[1].toFixed(1)} metres high` +
+    (room.floor_area ? `, floor area ${room.floor_area.toFixed(1)} square metres` : '') +
+    '.',
+  ];
+  const lo = room.bounds_min || [0, 0, 0];
+  const hi = room.bounds_max || [1, 1, 1];
+  const place = (c) => {
+    const fx = (c[0] - lo[0]) / Math.max(hi[0] - lo[0], 1e-6);
+    const fz = (c[2] - lo[2]) / Math.max(hi[2] - lo[2], 1e-6);
+    const across = fx < 0.33 ? 'left' : fx > 0.67 ? 'right' : 'centre';
+    const along = fz < 0.33 ? 'near' : fz > 0.67 ? 'far' : 'middle';
+    return `${along} ${across}`;
+  };
+  if (meta.objects.length) {
+    parts.push(`${meta.objects.length} objects: ` + meta.objects.map((o) =>
+      `${String(o.label).split(';')[0]}, ` +
+      `${o.size[0].toFixed(2)} by ${o.size[1].toFixed(2)} by ` +
+      `${o.size[2].toFixed(2)} metres, ${place(o.centroid)}`).join('; ') + '.');
+  } else {
+    parts.push('No objects were reconstructed.');
+  }
+  const surfaces = meta.surfaces || [];
+  if (surfaces.length) {
+    parts.push(`${surfaces.length} surfaces: ` + surfaces.map(
+      (s) => `${s.kind} ${s.area.toFixed(1)} square metres`).join(', ') + '.');
+  }
+  if (meta.gravity_aligned === false) {
+    parts.push('Note: this scene is not gravity aligned, so heights and sizes ' +
+               'are measured in the camera frame rather than the room frame.');
+  }
+  return parts.join(' ');
 }
 
 // --- click an object in the 3D view to frame it ---------------------------
@@ -316,10 +439,16 @@ document.getElementById('t-bylabel').addEventListener('change', (e) => {
     objects.checked = true;
     setVisible('objects', true);
   }
+  // This control silently changes two others; say so, or a screen-reader user
+  // is left with a layer state they were never told about.
+  announce(on
+    ? 'Colour by object class on. Point cloud hidden, object points shown.'
+    : 'Colour by object class off. Point cloud shown.');
 });
 document.getElementById('point-size').addEventListener('input', (e) =>
   applyPointSize(parseFloat(e.target.value)));
 
+let framedBounds = null;
 function resize() {
   const width = stage.clientWidth, height = stage.clientHeight;
   // Note: no `false` third argument -- three.js must set the canvas CSS
@@ -329,8 +458,16 @@ function resize() {
   renderer.setSize(width, height);
   camera.aspect = width / Math.max(height, 1);
   camera.updateProjectionMatrix();
+  // Also refresh the device pixel ratio: it changes when a window moves
+  // between displays, and setPixelRatio is otherwise only read once at load.
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 }
-addEventListener('resize', resize);
+addEventListener('resize', () => {
+  resize();
+  // Rotating a phone swaps which axis is constrained; without re-framing, the
+  // scene can end up mostly off-screen.
+  if (framedBounds) frameBox(framedBounds);
+});
 
 function animate() {
   requestAnimationFrame(animate);
@@ -388,10 +525,12 @@ async function main() {
 
   const room = meta.room || {};
   const extent = room.extent || [0, 0, 0];
-  document.getElementById('stats').textContent =
+  summaryText =
     `${meta.summary.object_count} objects | ${meta.summary.surface_count} surfaces | ` +
     `${meta.summary.point_count.toLocaleString()} points | ` +
     `${extent.map((v) => v.toFixed(1)).join(' x ')} m`;
+  document.getElementById('stats').textContent = summaryText;
+  document.getElementById('scene-description').textContent = describeScene(meta);
 
   // A handle for scripting and for automated checks: everything the page
   // builds, reachable from the console.

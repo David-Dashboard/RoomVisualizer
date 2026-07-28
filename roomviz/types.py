@@ -36,6 +36,12 @@ class CameraIntrinsics:
     cx: float
     cy: float
 
+    provenance: str = "unknown"
+    """Where these came from: ``explicit_intrinsics``, ``hfov_flag``, ``exif``
+    or ``assumed_default``.  Every reported dimension scales with the focal
+    length, so a consumer must be able to tell a measured camera from a
+    guessed one."""
+
     @classmethod
     def from_hfov(
         cls, width: int, height: int, hfov_deg: float = 60.0
@@ -92,6 +98,7 @@ class CameraIntrinsics:
             "fy": self.fy,
             "cx": self.cx,
             "cy": self.cy,
+            "provenance": self.provenance,
         }
 
 
@@ -249,10 +256,33 @@ class PlaneSurface:
     inlier_count: int = 0
     area: float = 0.0
 
+    @property
+    def extents(self) -> tuple[float, float]:
+        """``(width, height)`` of the bounded surface, in metres.
+
+        The quad's corners are ordered around the rectangle, so adjacent edges
+        give the two side lengths.  For a wall this is the number a user
+        actually wants -- "how long is this wall and how tall is it" -- which
+        an area and four raw corner coordinates do not answer.
+        """
+        import numpy as _np
+
+        quad = _np.asarray(self.quad, dtype=float)
+        a = float(_np.linalg.norm(quad[1] - quad[0]))
+        b = float(_np.linalg.norm(quad[2] - quad[1]))
+        if self.kind == "wall":
+            # Report the horizontal span first, then the vertical one.
+            vertical = abs(quad[1][1] - quad[0][1]) > abs(quad[2][1] - quad[1][1])
+            return (b, a) if vertical else (a, b)
+        return (max(a, b), min(a, b))
+
     def to_dict(self) -> dict[str, Any]:
+        width, height = self.extents
         return {
             "surface_id": self.surface_id,
             "kind": self.kind,
+            "width": round(width, 4),
+            "height": round(height, 4),
             "normal": [round(float(v), 4) for v in self.normal],
             "offset": round(float(self.offset), 4),
             "quad": [[round(float(v), 4) for v in c] for c in self.quad],

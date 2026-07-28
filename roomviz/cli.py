@@ -11,6 +11,8 @@ import sys
 import webbrowser
 from pathlib import Path
 
+import numpy as np
+
 from .config import PipelineConfig
 from .perception.base import available_backends
 
@@ -34,7 +36,7 @@ def _add_reconstruct_args(parser: argparse.ArgumentParser) -> None:
                        help="drop frames blurrier than this (0 = keep all)")
 
     group = parser.add_argument_group("camera")
-    group.add_argument("--hfov", type=float, default=defaults.hfov_deg,
+    group.add_argument("--hfov", type=float, default=None,
                        help="assumed horizontal field of view in degrees")
     group.add_argument("--intrinsics", type=float, nargs=4, metavar=("FX", "FY", "CX", "CY"),
                        help="explicit pinhole intrinsics, in input-resolution pixels")
@@ -102,12 +104,14 @@ def _add_reconstruct_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
+    defaults_hfov = PipelineConfig().hfov_deg
     return PipelineConfig(
         max_frames=args.max_frames,
         frame_stride=args.frame_stride,
         min_sharpness=args.min_sharpness,
         max_side=args.max_side,
-        hfov_deg=args.hfov,
+        hfov_deg=defaults_hfov if args.hfov is None else args.hfov,
+        hfov_explicit=args.hfov is not None,
         intrinsics=tuple(args.intrinsics) if args.intrinsics else None,
         depth_backend=args.depth_backend,
         depth_model=args.depth_model,
@@ -141,7 +145,12 @@ def _config_from_args(args: argparse.Namespace) -> PipelineConfig:
     )
 
 
-def serve(directory: str | Path, port: int = 8000, open_browser: bool = True) -> None:
+def serve(
+    directory: str | Path,
+    port: int = 8000,
+    open_browser: bool = True,
+    host: str = "127.0.0.1",
+) -> None:
     """Serve a results directory over HTTP so the viewer can fetch its assets."""
     directory = Path(directory).resolve()
     if not (directory / "viewer.html").exists():
@@ -154,9 +163,41 @@ def serve(directory: str | Path, port: int = 8000, open_browser: bool = True) ->
     class Server(socketserver.TCPServer):
         allow_reuse_address = True
 
-    with Server(("127.0.0.1", port), handler) as httpd:
-        url = f"http://127.0.0.1:{port}/viewer.html"
+    # A stale server from an earlier run is the normal case, not an error;
+    # walk up a few ports rather than dumping a traceback.
+    httpd = None
+    for candidate in range(port, port + 20):
+        try:
+            httpd = Server((host, candidate), handler)
+            break
+        except OSError:
+            continue
+    if httpd is None:
+        print(
+            f"error: no free port in {port}-{port + 19} on {host}. "
+            f"Stop the other server, or pass --port.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    with httpd:
+        bound = httpd.server_address[1]
+        if bound != port:
+            print(f"port {port} was busy; using {bound}")
+        display_host = "127.0.0.1" if host in ("127.0.0.1", "localhost") else host
+        url = f"http://{display_host}:{bound}/viewer.html"
         print(f"serving {directory} at {url}  (ctrl-c to stop)")
+        if host == "0.0.0.0":
+            import socket
+
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                probe.connect(("10.255.255.255", 1))
+                lan = probe.getsockname()[0]
+                probe.close()
+                print(f"  on your network:  http://{lan}:{bound}/viewer.html")
+            except OSError:
+                pass
         if open_browser:
             webbrowser.open(url)
         try:
@@ -189,6 +230,9 @@ def build_parser() -> argparse.ArgumentParser:
     view.add_argument("directory", nargs="?", default="output")
     view.add_argument("-p", "--port", type=int, default=8000)
     view.add_argument("--no-browser", action="store_true")
+    view.add_argument("--host", default="127.0.0.1",
+                      help="address to bind; use 0.0.0.0 to reach the viewer "
+                           "from a phone on the same network")
 
     sub.add_parser("backends", help="list the available perception backends")
 
@@ -223,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "view":
-        serve(args.directory, args.port, not args.no_browser)
+        serve(args.directory, args.port, not args.no_browser, args.host)
         return 0
 
     if args.command != "reconstruct":
@@ -241,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
     except ImportError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 3
+    except RuntimeError as exc:
+        # Model-weight failures carry a multi-line explanation; print it as-is.
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
     except ValueError as exc:
         # Bad configuration, unreadable sidecars, or input that yielded no
         # usable geometry.  These already carry actionable messages; what they
@@ -254,6 +302,17 @@ def main(argv: list[str] | None = None) -> int:
     scene = result.scene
     print()
     print(f"Reconstructed {result.output_dir} in {result.elapsed:.1f}s")
+    intr = scene.intrinsics
+    if intr is not None:
+        note = {
+            "explicit_intrinsics": "from --intrinsics",
+            "hfov_flag": "from --hfov",
+            "exif": "from image EXIF",
+            "assumed_default": "ASSUMED -- pass --hfov or --intrinsics to measure",
+        }.get(intr.provenance, intr.provenance)
+        hfov = np.rad2deg(2 * np.arctan((intr.width / 2.0) / intr.fx))
+        print(f"  camera   : {hfov:.0f} deg horizontal FOV, {note}")
+    print("  sizes are width x height x depth, in metres")
     print(f"  points   : {scene.points.shape[0]:,}")
     print(f"  objects  : {len(scene.objects)}")
     for inst in scene.objects[:20]:
@@ -266,9 +325,13 @@ def main(argv: list[str] | None = None) -> int:
         )
     if len(scene.objects) > 20:
         print(f"      ... and {len(scene.objects) - 20} more")
-    print(f"  surfaces : {len(scene.surfaces)}")
+    print(f"  surfaces : {len(scene.surfaces)}  (width x height, metres)")
     for surface in scene.surfaces:
-        print(f"      [{surface.surface_id:>3}] {surface.kind:<10} {surface.area:6.2f} m2")
+        width, height = surface.extents
+        print(
+            f"      [{surface.surface_id:>3}] {surface.kind:<10}"
+            f" {width:5.2f} x {height:5.2f} m   area {surface.area:6.2f} m2"
+        )
     print()
     print(f"  open the viewer with:  roomviz view {result.output_dir}")
 

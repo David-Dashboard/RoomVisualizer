@@ -31,6 +31,10 @@ class PipelineConfig:
     intrinsics: tuple[float, float, float, float] | None = None
     """Explicit ``(fx, fy, cx, cy)`` at the *original* input resolution."""
 
+    hfov_explicit: bool = False
+    """Whether ``hfov_deg`` was supplied by the user rather than defaulted.
+    An explicit value outranks EXIF; the default does not."""
+
     # ---- perception backends --------------------------------------------
     depth_backend: str = "depth-anything-v2"
     depth_model: str = "depth-anything/Depth-Anything-V2-metric-indoor-small-hf"

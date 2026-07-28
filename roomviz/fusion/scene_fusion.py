@@ -322,6 +322,31 @@ def _finalise_instances(
     return kept
 
 
+def _warn_if_implausible(scene: Scene, intrinsics) -> None:
+    """Shout when the reconstruction is not a plausible room.
+
+    Everything scales with the focal length, so a wrong field of view produces
+    a self-consistent, confidently-reported, entirely wrong room - a 1.5 m
+    ceiling and a 36 cm sofa - with nothing else to give it away.  The scale is
+    unknowable from the data, but implausibility is not.
+    """
+    if scene.points.shape[0] == 0:
+        return
+    lo, hi = scene.bounds
+    height = float(hi[1] - lo[1])
+    guessed = getattr(intrinsics, "provenance", "") == "assumed_default"
+    if 1.9 <= height <= 6.0:
+        return
+    log.warning(
+        "The reconstructed room is %.2f m from floor to ceiling, which is not a "
+        "plausible interior. Every dimension scales with the assumed field of "
+        "view%s, so the whole scene is likely mis-scaled by roughly %.1fx.",
+        height,
+        " (which was guessed, not measured)" if guessed else "",
+        2.5 / max(height, 1e-3),
+    )
+
+
 def fuse(observations: list[Observation], cfg: PipelineConfig) -> Scene:
     """Build a :class:`Scene` from per-frame perception output."""
     if not observations:
@@ -436,6 +461,7 @@ def fuse(observations: list[Observation], cfg: PipelineConfig) -> Scene:
             "voxel_size": cfg.voxel_size,
         },
     )
+    _warn_if_implausible(scene, observations[0].intrinsics)
     lo, hi = scene.bounds
     log.info(
         "scene: %d points, %d objects, %d surfaces, extent %s m",

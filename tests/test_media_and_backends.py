@@ -125,12 +125,27 @@ def test_classify_media_rejects_missing_file(tmp_path):
         classify_media(tmp_path / "nope.mp4")
 
 
-def test_resize_frame_snaps_to_patch_multiple():
-    out = resize_frame(np.zeros((480, 640, 3), np.uint8), 768)
-    assert out.shape[0] % 14 == 0 and out.shape[1] % 14 == 0
-    # Downscaling must respect the cap on the longest side.
-    small = resize_frame(np.zeros((1000, 2000, 3), np.uint8), 700)
-    assert max(small.shape[:2]) <= 700 + 14
+def test_resize_frame_leaves_small_images_alone():
+    """An image already within the cap must not be touched.
+
+    Snapping it to a patch multiple used to *upscale* 640x480 to 644x476,
+    changing the aspect ratio for no benefit -- and that 1.5% change then
+    tripped the pipeline's own sidecar warning on the documented quickstart,
+    telling users their reconstruction was wrong when it was not.
+    """
+    original = np.zeros((480, 640, 3), np.uint8)
+    out = resize_frame(original, 768)
+    assert out.shape == original.shape
+    assert out is original
+
+
+def test_resize_frame_honours_the_cap_when_downscaling():
+    for height, width, cap in ((1000, 2000, 700), (1080, 1920, 768), (3000, 4000, 512)):
+        out = resize_frame(np.zeros((height, width, 3), np.uint8), cap)
+        assert max(out.shape[:2]) <= cap, (height, width, cap, out.shape)
+        assert out.shape[0] % 14 == 0 and out.shape[1] % 14 == 0
+        # Aspect ratio preserved to within one patch on the short side.
+        assert abs(out.shape[1] / out.shape[0] - width / height) < 0.05
 
 
 def test_sharpness_ranks_blur():

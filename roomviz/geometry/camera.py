@@ -77,26 +77,42 @@ def resolve_intrinsics(
     pixels at the working resolution would skew every back-projected point.
     """
     source_width, source_height = original_size or (width, height)
+    provenance = "assumed_default"
 
     if cfg.intrinsics is not None:
+        provenance = "explicit_intrinsics"
         fx, fy, cx, cy = cfg.intrinsics
         base = CameraIntrinsics(
             width=source_width, height=source_height, fx=fx, fy=fy, cx=cx, cy=cy
         )
     else:
         base = None
-        if source_path:
-            base = intrinsics_from_exif(source_path, source_width, source_height)
-        if base is None:
-            log.info(
-                "assuming %.0f degree horizontal FOV (override with --hfov/--intrinsics)",
-                cfg.hfov_deg,
-            )
+        if cfg.hfov_explicit:
+            # An explicitly supplied --hfov outranks EXIF: the user is telling
+            # us something about the capture that the file metadata may have
+            # lost (a crop, a digital zoom, a re-encode).
+            provenance = "hfov_flag"
             base = CameraIntrinsics.from_hfov(source_width, source_height, cfg.hfov_deg)
+        else:
+            if source_path:
+                base = intrinsics_from_exif(source_path, source_width, source_height)
+                if base is not None:
+                    provenance = "exif"
+            if base is None:
+                log.warning(
+                    "No camera information: assuming a %.0f degree horizontal "
+                    "field of view. Every reported dimension scales with this "
+                    "guess -- a wrong FOV silently shrinks or inflates the whole "
+                    "room. Pass --hfov or --intrinsics for measurable output.",
+                    cfg.hfov_deg,
+                )
+                base = CameraIntrinsics.from_hfov(
+                    source_width, source_height, cfg.hfov_deg
+                )
 
-    if (base.width, base.height) == (width, height):
-        return base
-    return base.scaled_to(width, height)
+    resolved = base if (base.width, base.height) == (width, height) else base.scaled_to(width, height)
+    resolved.provenance = provenance
+    return resolved
 
 
 def pixel_rays(intr: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:

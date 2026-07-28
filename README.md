@@ -159,21 +159,46 @@ Scale accuracy depends on the camera's field of view. In order of preference:
 ```
 
 For a single image, EXIF `FocalLengthIn35mmFilm` is used automatically when
-present. Otherwise the default assumption is 60°, which is a typical phone
-main camera; a wide-angle lens needs telling.
+present. An explicit `--hfov` overrides EXIF. Otherwise the default assumption
+is 60°, and **the tool warns you loudly**, because everything scales with it.
+
+This is the single largest source of wrong numbers. A wrong field of view does
+not look wrong — it produces a self-consistent room of the wrong size. At 60°
+on a 95° capture the demo room comes back 1.6 m tall with a 37 cm sofa. The
+reconstruction is checked for plausibility and will warn, but a subtler error
+(70° guessed for a 60° lens) passes silently at ~15% off.
+
+`scene.json` records where the camera came from, so you can always tell a
+measured reconstruction from a guessed one:
+
+```json
+"intrinsics": { "fx": 554.3, "provenance": "assumed_default" }
+```
+
+`provenance` is one of `explicit_intrinsics`, `hfov_flag`, `exif` or
+`assumed_default`. Treat `assumed_default` as "shape is right, scale is a
+guess".
+
+Video carries no EXIF, so for video you should always pass `--hfov` or
+`--intrinsics`.
 
 ### Commonly useful options
 
 | Option | What it does |
 | --- | --- |
 | `--max-frames N` | keyframes taken from a video (default 24) |
+| `--frame-stride N` | sample every Nth video frame (0 = automatic) |
 | `--max-side N` | working resolution (default 768) |
 | `--min-sharpness F` | drop blurry frames; try `50`-`200` for handheld video |
 | `--device cuda` | run the models on a GPU |
 | `--voxel 0.02` | finer/coarser reconstruction |
 | `--depth-trunc 8` | ignore depth past N metres (helps with windows) |
 | `--no-align` | keep the original camera frame, skip gravity alignment |
+| `--depth-min M` | ignore depth closer than this |
 | `--open` | serve and open the viewer when finished |
+
+`roomviz view` takes `--host 0.0.0.0` to serve the viewer to a phone on the
+same network, and walks up a few ports if the one you asked for is busy.
 
 `roomviz reconstruct --help` lists everything.
 
@@ -212,6 +237,22 @@ roomviz reconstruct scan.mp4 -o output \
 `--depth-scale 0.001` for millimetres). Masks work the same way via
 `--seg-backend file --seg-dir masks/`, where `masks/` holds integer segment-id
 maps plus a `labels.json` of `{"1": "wall", "2": "floor", "3": "chair"}`.
+
+**The structural names matter.** Only these are recognised as room shell, after
+splitting on `;` `,` `/`: `wall`/`walls`; `floor`/`flooring`/`rug`/`carpet`;
+`ceiling`; `windowpane`/`window`; `door`; `column`/`pillar`; `stairs`. Anything
+else — including `wall_1` or `left_wall` — becomes an *object*, and you will
+get no wall planes at all.
+
+Other things worth knowing about sidecars:
+
+* Files are matched by **source frame index, 0-based** (`000000.npy` is the
+  first video frame). A 1-indexed export is detected and refused, because it
+  would otherwise pair every frame with the previous frame's data.
+* Depth may be `float32`/`float64` (metres) or an integer type (scaled by
+  `--depth-scale`, default mm). `--depth-scale` is ignored for float input.
+* Zero, negative, NaN and infinite depths are all treated as invalid.
+* In a mask, `-1` means "unlabelled"; `0` is a normal segment id.
 
 If one mask covers several objects — the panoptic "stuff" case — say so, and
 they will be separated in 3D rather than fused into one:

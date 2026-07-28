@@ -22,6 +22,31 @@ from .base import register_depth, resolve_device
 log = logging.getLogger(__name__)
 
 
+def _weights_error(source: str, exc: Exception) -> RuntimeError:
+    """Explain a failed weight download in terms a user can act on.
+
+    The raw exception is four lines of urllib3/HF internals that never mention
+    the words "download" or "model file", and never mention that this package
+    ships a complete offline path.  That is the point at which people give up.
+    """
+    detail = str(exc).strip().splitlines()[0][:200] if str(exc).strip() else type(exc).__name__
+    return RuntimeError(
+        f"Could not load the model weights for {source!r}.\n"
+        f"  Cause: {detail}\n"
+        "\n"
+        "This step downloads model files from huggingface.co. If you are "
+        "offline, behind a proxy, or the host is blocked:\n"
+        "  * pre-download the weights elsewhere and point at them with "
+        "--models-dir <dir> --offline\n"
+        "  * or try the whole pipeline right now with no weights at all:\n"
+        "        python examples/make_demo_room.py --out demo\n"
+        "        roomviz reconstruct demo/room.mp4 -o output \\\n"
+        "            --depth-backend file --depth-dir demo/depth \\\n"
+        "            --seg-backend file --seg-dir demo/segmentation --hfov 95\n"
+        "  * or supply your own depth and masks (see 'Bring your own depth' "
+        "in the README)")
+
+
 def _relative_to_metric(
     disparity: np.ndarray, near: float = 0.4, far: float = 10.0
 ) -> np.ndarray:
@@ -66,8 +91,11 @@ class DepthAnythingBackend:
             kwargs["cache_dir"] = cfg.models_dir
         if cfg.offline:
             kwargs["local_files_only"] = True
-        self.processor = AutoImageProcessor.from_pretrained(source, **kwargs)
-        self.model = AutoModelForDepthEstimation.from_pretrained(source, **kwargs)
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(source, **kwargs)
+            self.model = AutoModelForDepthEstimation.from_pretrained(source, **kwargs)
+        except Exception as exc:
+            raise _weights_error(source, exc) from None
         self.model.to(self.device).eval()
 
         est_type = getattr(self.model.config, "depth_estimation_type", None)

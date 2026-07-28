@@ -75,7 +75,13 @@ def resize_frame(rgb: np.ndarray, max_side: int) -> np.ndarray:
     match (see `resolve_intrinsics`), so geometry is unaffected.
     """
     h, w = rgb.shape[:2]
-    scale = min(1.0, max_side / float(max(h, w)))
+    if max(h, w) <= max_side:
+        # Already within the cap: leave it exactly alone.  Snapping to a patch
+        # multiple here would *upscale* 640x480 to 644x476 - changing the
+        # aspect ratio by 1.5%, for no benefit, on input the user never asked
+        # to be touched.  Model processors resample internally anyway.
+        return rgb
+    scale = max_side / float(max(h, w))
     # Round the long side *down* to a patch multiple so the cap is honoured -
     # rounding to nearest could exceed it (1920x1080 at max_side 768 gave 770).
     if w >= h:
