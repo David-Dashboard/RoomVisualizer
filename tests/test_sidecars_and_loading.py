@@ -616,3 +616,78 @@ def test_the_suggested_frame_count_would_actually_clear_the_threshold(tmp_path, 
         r for r in caplog.records
         if r.levelname == "WARNING" and "keyframe every" in r.getMessage()
     ], f"taking the advice ({suggested}) still warns"
+
+
+def _photo_folder(tmp_path, count: int, f35: int | None = 13, name: str = "photos"):
+    """A folder of "phone photos", optionally carrying a 35mm-equivalent focal
+    length in EXIF the way every camera app writes one."""
+    from PIL import Image
+
+    directory = tmp_path / name
+    directory.mkdir()
+    rng = np.random.default_rng(0)
+    for i in range(count):
+        img = Image.fromarray(rng.integers(0, 255, (240, 320, 3), dtype=np.uint8))
+        exif = Image.Exif()
+        if f35 is not None:
+            exif[41989] = f35  # FocalLengthIn35mmFilm
+        img.save(directory / f"IMG_{i:04d}.jpg", exif=exif)
+    return directory
+
+
+def test_a_folder_of_photos_takes_its_field_of_view_from_exif(tmp_path):
+    """README: EXIF is used when no field of view is given.
+
+    This was gated on there being exactly one frame, so a *folder* of photos --
+    the obvious way to shoot a room, and the case where every file carries a
+    focal length -- silently fell back to the assumed default instead, and
+    every reported dimension then scaled with a guess.
+    """
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    directory = _photo_folder(tmp_path, 12)
+    cfg = PipelineConfig(max_frames=12, max_side=320)
+    frames = load_frames(directory, cfg)
+    intr = resolve_intrinsics(
+        cfg, frames[0].width, frames[0].height,
+        source_path=frames[0].source, original_size=frames[0].original_size,
+    )
+    assert intr.provenance == "exif"
+    # 13 mm equivalent is an ultra-wide: the point is that it is nowhere near
+    # the 60 degree default that would otherwise have been assumed.
+    hfov = np.degrees(2 * np.arctan((intr.width / 2) / intr.fx))
+    assert hfov > 100.0, hfov
+
+
+def test_photos_without_exif_still_fall_back_to_the_assumed_default(tmp_path):
+    """The control: reading EXIF must not invent one when there is none."""
+    from roomviz.geometry.camera import resolve_intrinsics
+
+    directory = _photo_folder(tmp_path, 6, f35=None, name="bare")
+    cfg = PipelineConfig(max_frames=6, max_side=320)
+    frames = load_frames(directory, cfg)
+    intr = resolve_intrinsics(
+        cfg, frames[0].width, frames[0].height,
+        source_path=frames[0].source, original_size=frames[0].original_size,
+    )
+    assert intr.provenance == "assumed_default"
+
+
+def test_discarding_deliberately_taken_photos_is_warned_about(tmp_path, caplog):
+    directory = _photo_folder(tmp_path, 40, name="many")
+    with caplog.at_level("WARNING"):
+        frames = load_frames(directory, PipelineConfig(max_frames=24, max_side=320))
+    assert len(frames) < 40
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("photos" in w and "--max-frames" in w for w in warnings), warnings
+
+
+def test_using_every_photo_is_not_warned_about(tmp_path, caplog):
+    directory = _photo_folder(tmp_path, 20, name="allofthem")
+    with caplog.at_level("WARNING"):
+        frames = load_frames(directory, PipelineConfig(max_frames=20, max_side=320))
+    assert len(frames) == 20
+    assert not [
+        r for r in caplog.records
+        if r.levelname == "WARNING" and "photos" in r.getMessage()
+    ]

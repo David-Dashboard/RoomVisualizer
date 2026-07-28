@@ -90,7 +90,14 @@ def reconstruct(
         cfg,
         frames[0].width,
         frames[0].height,
-        source_path=frames[0].source if len(frames) == 1 else None,
+        # Any frame carrying a source file can supply EXIF, not just a lone
+        # image.  A folder of phone photos is the case that matters: every shot
+        # has a focal length recorded, and gating this on `len(frames) == 1`
+        # threw all of it away and fell back to a guessed field of view - which
+        # then silently scales every dimension in the output.  Frames from a
+        # video name the video file, where there is no EXIF to find, so this
+        # simply falls through to the assumed default as before.
+        source_path=frames[0].source,
         original_size=frames[0].original_size,
     )
     log.info(

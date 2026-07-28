@@ -232,6 +232,18 @@ def load_frames(path: str | os.PathLike[str], cfg: PipelineConfig) -> list[Frame
             p for p in source.path.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS
         )
         step = max(1, int(np.ceil(len(paths) / max(1, cfg.max_frames))))
+        if step > 1:
+            # Stills are not video: every one of these was framed deliberately,
+            # and dropping two out of three both throws away the coverage the
+            # photographer meant to provide and widens the baseline between
+            # consecutive shots, which is what tracking has to bridge.
+            log.warning(
+                "Using %d of %d photos (every %d%s). Each photo was chosen "
+                "deliberately and discarding them widens the gap the camera "
+                "tracker has to bridge; pass --max-frames %d to use them all.",
+                len(paths[::step][: cfg.max_frames]), len(paths), step,
+                {2: "nd", 3: "rd"}.get(step, "th"), len(paths),
+            )
         frames = []
         for i, p in enumerate(paths[::step][: cfg.max_frames]):
             full = _read_image(p)
